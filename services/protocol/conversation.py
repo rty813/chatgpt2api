@@ -355,6 +355,7 @@ class ConversationState:
     text: str = ""
     raw_text: str = ""
     reasoning: str = ""
+    reasoning_seconds: int = 0
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
@@ -516,6 +517,125 @@ def _join_thoughts(thoughts: list[Any]) -> str:
     return "\n\n".join(part for part in parts if part).strip()
 
 
+def _append_unique_line(parts: list[str], value: object) -> None:
+    text = str(value or "").strip()
+    if text and text not in parts:
+        parts.append(text)
+
+
+def _search_queries_text(value: object) -> str:
+    queries: list[str] = []
+    if isinstance(value, dict) and isinstance(value.get("queries"), list):
+        for item in value["queries"]:
+            _append_unique_line(queries, item)
+    if not queries:
+        return ""
+    return "搜索：\n" + "\n".join(f"- {query}" for query in queries)
+
+
+def _tool_code_text(text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return text.strip()
+    if not isinstance(payload, dict):
+        return text.strip()
+    parts: list[str] = []
+    for key in ("system1_search_query", "search_query"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        queries: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                _append_unique_line(queries, item.get("q") or item.get("query"))
+            else:
+                _append_unique_line(queries, item)
+        if queries:
+            parts.append("搜索：\n" + "\n".join(f"- {query}" for query in queries))
+    if isinstance(payload.get("open"), list):
+        refs: list[str] = []
+        for item in payload["open"]:
+            if isinstance(item, dict):
+                _append_unique_line(refs, item.get("ref_id") or item.get("url"))
+        if refs:
+            parts.append("打开资料：\n" + "\n".join(f"- {ref}" for ref in refs))
+    return "\n\n".join(parts).strip() or text.strip()
+
+
+def _reasoning_activity_text(message: dict[str, Any]) -> str:
+    """从 reasoning metadata / tool activity 提取网页展开里可见的思考摘要。"""
+    metadata = message.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    content = message.get("content") or {}
+    parts: list[str] = []
+    titles = metadata.get("reasoning_titles")
+    if isinstance(titles, list):
+        for title in titles:
+            _append_unique_line(parts, title)
+    _append_unique_line(parts, metadata.get("reasoning_title"))
+    query_text = _search_queries_text(metadata.get("search_model_queries"))
+    if query_text:
+        parts.append(query_text)
+    if isinstance(content, dict) and content.get("content_type") == "code":
+        code_text = _tool_code_text(str(content.get("text") or ""))
+        if code_text and code_text not in parts:
+            parts.append(code_text)
+    return "\n\n".join(parts).strip()
+
+
+def _reasoning_recap_text(message: dict[str, Any]) -> str:
+    """提取 reasoning_recap 文案，如“已思考 1m 11s”。"""
+    content = message.get("content") or {}
+    if not isinstance(content, dict):
+        return ""
+    value = content.get("content")
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item is not None).strip()
+    if value is None:
+        value = content.get("text")
+    return str(value or "").strip()
+
+
+def _parse_reasoning_recap_seconds(text: str) -> int:
+    """从“已思考 14s”/“Thought for 1m 11s”/“已思考 1分11秒”解析总秒数。"""
+    if not text:
+        return 0
+    minutes = re.search(r"(\d+)\s*(?:m|分|分钟|min)", text)
+    secs = re.search(r"(\d+)\s*(?:s|秒|sec)", text)
+    total = 0
+    if minutes:
+        total += int(minutes.group(1)) * 60
+    if secs:
+        total += int(secs.group(1))
+    if total == 0:
+        lone = re.search(r"(\d+)", text)
+        if lone:
+            total = int(lone.group(1))
+    return total
+
+
+def _reasoning_seconds_for_message(message: dict[str, Any]) -> int:
+    """优先使用 metadata.finished_duration_sec，缺失时从 reasoning_recap 文案解析。"""
+    metadata = message.get("metadata") or {}
+    if isinstance(metadata, dict):
+        duration = metadata.get("finished_duration_sec")
+        if duration is not None:
+            try:
+                return max(0, int(round(float(duration))))
+            except (TypeError, ValueError):
+                pass
+        start = metadata.get("reasoning_start_time")
+        end = metadata.get("reasoning_end_time")
+        if start is not None and end is not None:
+            try:
+                return max(0, int(round(float(end) - float(start))))
+            except (TypeError, ValueError):
+                pass
+    return _parse_reasoning_recap_seconds(_reasoning_recap_text(message))
+
+
 def assistant_reasoning_raw(event: dict[str, Any], current_reasoning: str = "") -> str:
     """从事件里提取思考（reasoning）累计文本。
 
@@ -531,11 +651,16 @@ def assistant_reasoning_raw(event: dict[str, Any], current_reasoning: str = "") 
         if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
             continue
         content = message.get("content")
-        if not isinstance(content, dict) or content.get("content_type") != "thoughts":
+        if not isinstance(content, dict):
             continue
-        thoughts = content.get("thoughts")
-        if isinstance(thoughts, list):
-            text = _join_thoughts(thoughts)
+        if content.get("content_type") == "thoughts":
+            thoughts = content.get("thoughts")
+            if isinstance(thoughts, list):
+                text = _join_thoughts(thoughts)
+                if text:
+                    return text
+        if content.get("content_type") == "reasoning_recap":
+            text = _reasoning_recap_text(message)
             if text:
                 return text
     return current_reasoning
@@ -578,6 +703,52 @@ def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text
         if isinstance(item, dict):
             text = apply_text_patch(item, text, history_text)
     return text
+
+
+def _patch_reasoning_value(operation: dict[str, Any]) -> str:
+    value = operation.get("v")
+    if isinstance(value, list):
+        joined = _join_thoughts(value)
+        if joined:
+            return joined
+        return "\n".join(str(item).strip() for item in value if str(item or "").strip())
+    if isinstance(value, dict):
+        return _join_thoughts([value]) or json.dumps(value, ensure_ascii=False)
+    return str(value or "")
+
+
+def apply_reasoning_patch(event: dict[str, Any], current_text: str = "") -> str:
+    """应用 thoughts/code reasoning 的增量补丁。"""
+    path = str(event.get("p") or "")
+    op = event.get("o")
+    if op in ("append", "replace") and (
+        path.startswith("/message/content/thoughts")
+        or path.startswith("/message/content/text")
+        or path == "/message/content"
+    ):
+        value = _patch_reasoning_value(event)
+        if not value:
+            return current_text
+        if op == "replace":
+            return value
+        return current_text + value
+
+    operations = event.get("v")
+    if isinstance(operations, str) and not event.get("p") and not event.get("o"):
+        return current_text + operations
+    if event.get("o") == "patch" and isinstance(operations, list):
+        text = current_text
+        for item in operations:
+            if isinstance(item, dict):
+                text = apply_reasoning_patch(item, text)
+        return text
+    if isinstance(operations, list):
+        text = current_text
+        for item in operations:
+            if isinstance(item, dict):
+                text = apply_reasoning_patch(item, text)
+        return text
+    return current_text
 
 
 def apply_patch_op(operation: dict[str, Any], current_text: str, history_text: str = "") -> str:
@@ -694,6 +865,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "type": event_type,
         "text": state.text,
         "reasoning": state.reasoning,
+        "reasoning_seconds": state.reasoning_seconds,
         "conversation_id": state.conversation_id,
         "file_ids": list(state.file_ids),
         "sediment_ids": list(state.sediment_ids),
@@ -718,10 +890,14 @@ def _event_message(event: dict[str, Any]) -> dict[str, Any] | None:
 def _classify_message(message: dict[str, Any]) -> str:
     """思考 turn 的消息分类：thinking（思考/工具调用）| text（正文或预告白）| skip。"""
     role = str((message.get("author") or {}).get("role") or "").strip().lower()
+    metadata = message.get("metadata") or {}
+    reasoning_status = str(metadata.get("reasoning_status") or "") if isinstance(metadata, dict) else ""
+    if role == "tool" and reasoning_status == "is_reasoning":
+        return "thinking"
     if role != "assistant":
         return "skip"
     content_type = (message.get("content") or {}).get("content_type")
-    if content_type in ("thoughts", "code"):
+    if content_type in ("thoughts", "reasoning_recap", "code"):
         return "thinking"
     if content_type in ("text", "multimodal_text"):
         return "text"
@@ -731,7 +907,12 @@ def _classify_message(message: dict[str, Any]) -> str:
 def _message_text_for_kind(message: dict[str, Any]) -> str:
     content = message.get("content") or {}
     if content.get("content_type") == "thoughts":
-        return _join_thoughts(content.get("thoughts") or [])
+        return _join_thoughts(content.get("thoughts") or []) or _reasoning_activity_text(message)
+    if content.get("content_type") == "reasoning_recap":
+        return _reasoning_recap_text(message)
+    activity = _reasoning_activity_text(message)
+    if activity:
+        return activity
     return assistant_message_text(message)
 
 
@@ -755,6 +936,9 @@ def _advance_thinking_state(state: ConversationState, event: dict[str, Any], his
         return
     message = _event_message(event)
     if isinstance(message, dict) and message.get("id"):
+        seconds = _reasoning_seconds_for_message(message)
+        if seconds:
+            state.reasoning_seconds = max(state.reasoning_seconds, seconds)
         mid = str(message.get("id"))
         kind = _classify_message(message)
         if kind == "skip":
@@ -766,9 +950,10 @@ def _advance_thinking_state(state: ConversationState, event: dict[str, Any], his
         state.msg_text[mid] = _message_text_for_kind(message)
         state.cur_id = mid
         return
-    # 没有 message 的补丁（多为正文文本的 v/p 增量），追加到当前正文消息。
+    # 没有 message 的补丁（正文或思考的 v/p 增量），追加到当前消息。
     cur = state.cur_id
-    if cur and state.msg_kind.get(cur) == "text":
+    kind = state.msg_kind.get(cur)
+    if cur and kind == "text":
         current = state.msg_text.get(cur, "")
         value = event.get("v")
         if isinstance(value, str) and not event.get("p") and not event.get("o"):
@@ -776,6 +961,9 @@ def _advance_thinking_state(state: ConversationState, event: dict[str, Any], his
             state.msg_text[cur] = current + value
         else:
             state.msg_text[cur] = apply_text_patch(event, current, history_text)
+    elif cur and kind == "thinking":
+        current = state.msg_text.get(cur, "")
+        state.msg_text[cur] = apply_reasoning_patch(event, current)
 
 
 def _rebuild_thinking(state: ConversationState) -> tuple[str, str]:
@@ -785,6 +973,7 @@ def _rebuild_thinking(state: ConversationState) -> tuple[str, str]:
     其余 assistant 文本/思考/工具调用 → 思考。这样与到达顺序无关，不会把预告白误当正文。
     """
     reasoning_parts: list[str] = []
+    reasoning_seen: set[str] = set()
     answer = ""
     for mid in state.msg_order:
         kind = state.msg_kind.get(mid)
@@ -794,7 +983,10 @@ def _rebuild_thinking(state: ConversationState) -> tuple[str, str]:
         if kind == "text" and mid in state.final_ids:
             answer += text
         else:
-            reasoning_parts.append(text.strip())
+            cleaned = text.strip()
+            if cleaned and cleaned not in reasoning_seen:
+                reasoning_seen.add(cleaned)
+                reasoning_parts.append(cleaned)
     return answer, "\n\n".join(part for part in reasoning_parts if part)
 
 
@@ -974,6 +1166,7 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
             active_backend = OpenAIBackendAPI(access_token=token)
             produced = False
             answer_emitted = False
+            reasoning_emitted = False
             last_event: dict[str, Any] = {}
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt, thinking_effort=request.thinking_effort):
                 last_event = event
@@ -984,6 +1177,8 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                     produced = True
                     if event.get("delta"):
                         answer_emitted = True
+                    if event.get("reasoning_delta"):
+                        reasoning_emitted = True
                     yield event
             image_markdown = _image_gen_markdown(active_backend, last_event)
             if image_markdown:
@@ -995,18 +1190,24 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                 emitted = True
                 produced = True
                 yield {"type": "conversation.delta", "delta": sandbox_markdown, "reasoning_delta": ""}
-            # 思考模型异步产出（artifact handoff / 多步工具，如生成 PPT/幻灯片）：WS 流在最终答案前就结束，
-            # 正文为空。此时轮询会话文档拿迟到的最终答案。
+            # 思考模型异步产出（artifact handoff / 多步工具，如生成 PPT/幻灯片、浏览引用）：WS 流在最终答案前就结束，
+            # 正文为空。此时轮询会话文档拿迟到的最终答案，并一并取回思考内容与思考秒数，重建 <think>…Thought for Ns…</think>。
             if request.thinking_effort and not answer_emitted:
                 conversation_id = str(last_event.get("conversation_id") or "")
                 if conversation_id:
-                    polled_answer = active_backend.poll_thinking_answer(conversation_id, THINKING_ANSWER_POLL_TIMEOUT_SECS)
+                    polled = active_backend.poll_thinking_result(conversation_id, THINKING_ANSWER_POLL_TIMEOUT_SECS)
+                    polled_answer = (polled or {}).get("answer") or ""
                     if polled_answer:
                         emitted = True
                         produced = True
                         answer_emitted = True
                         account_service.mark_text_used(token)
-                        yield {"type": "conversation.delta", "delta": polled_answer, "reasoning_delta": ""}
+                        polled_reasoning = (polled or {}).get("reasoning") or ""
+                        polled_seconds = int((polled or {}).get("seconds") or 0)
+                        # WS 已流出部分思考则不重复补；否则用文档里的完整思考重建 <think>。
+                        if polled_reasoning and not reasoning_emitted:
+                            yield {"type": "conversation.delta", "delta": "", "reasoning_delta": polled_reasoning, "reasoning_seconds": polled_seconds}
+                        yield {"type": "conversation.delta", "delta": polled_answer, "reasoning_delta": "", "reasoning_seconds": polled_seconds}
                         return
             account_service.mark_text_used(token)
             if produced or not request.thinking_effort or empty_retries >= THINKING_EMPTY_MAX_RETRIES:
@@ -1043,7 +1244,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         yield "\n"
 
 
-def stream_text_events(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[dict[str, str]]:
+def stream_text_events(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[dict[str, Any]]:
     """产出 {"content", "reasoning"} 增量，供需要思考内容的 chat completion 使用。"""
     last_char = ""
     produced = False
@@ -1055,7 +1256,11 @@ def stream_text_events(backend: OpenAIBackendAPI, request: ConversationRequest) 
         if content:
             produced = True
             last_char = content[-1]
-        yield {"content": content, "reasoning": reasoning}
+        item = {"content": content, "reasoning": reasoning}
+        seconds = int(event.get("reasoning_seconds") or 0)
+        if seconds:
+            item["seconds"] = seconds
+        yield item
     if request.thinking_effort and produced and last_char != "\n":
         yield {"content": "\n", "reasoning": ""}
 
@@ -1070,7 +1275,10 @@ def collect_text_and_reasoning(backend: OpenAIBackendAPI, request: ConversationR
     reasoning_parts: list[str] = []
     t_reason: float | None = None
     t_answer: float | None = None
+    provided_seconds = 0
     for item in stream_text_events(backend, request):
+        if item.get("seconds"):
+            provided_seconds = int(item["seconds"])
         if item.get("reasoning"):
             if t_reason is None:
                 t_reason = time.time()
@@ -1079,7 +1287,8 @@ def collect_text_and_reasoning(backend: OpenAIBackendAPI, request: ConversationR
             if t_answer is None:
                 t_answer = time.time()
             content_parts.append(item["content"])
-    seconds = int(round(t_answer - t_reason)) if (t_reason is not None and t_answer is not None) else 0
+    # 文档回收路径给出的真实思考秒数优先；否则按首个思考增量到首个正文增量的耗时估算。
+    seconds = provided_seconds or (int(round(t_answer - t_reason)) if (t_reason is not None and t_answer is not None) else 0)
     return "".join(content_parts), "".join(reasoning_parts), seconds
 
 

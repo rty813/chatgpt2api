@@ -49,16 +49,15 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 
 
 THINK_OPEN = "<think>\n"
-ANSWER_HEADER = "## 回答:\n\n"
 
 
 def think_close(seconds: int) -> str:
-    """思考块收尾：Thought for Ns + </think>，随后接正文标题。"""
-    return f"\n\nThought for {int(seconds)}s\n</think>\n\n{ANSWER_HEADER}"
+    """思考块收尾：Thought for Ns + </think>，随后直接接正文。"""
+    return f"\n\nThought for {int(seconds)}s\n</think>\n\n"
 
 
 def wrap_think_block(reasoning: str, content: str, seconds: int = 0) -> str:
-    """把思考内容用 <think>…Thought for Ns…</think> 包起来，正文前加 ## 回答:（思考为空则原样返回正文）。"""
+    """把思考内容用 <think>…Thought for Ns…</think> 包起来；思考为空则原样返回正文。"""
     reasoning = (reasoning or "").strip()
     if not reasoning:
         return content
@@ -131,13 +130,16 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
         return completion_chunk(model, delta, None, completion_id, created)
 
     if emit_reasoning:
-        # 思考内容用 <think>…Thought for Ns…</think> 内联包在正文前面，正文前加 ## 回答:。
+        # 思考内容用 <think>…Thought for Ns…</think> 内联包在正文前面。
         think_open = False
         think_closed = False
         t0: float | None = None
+        provided_secs = 0
         for item in stream_text_events(backend, request):
             reasoning = item.get("reasoning") or ""
             content = item.get("content") or ""
+            if item.get("seconds"):
+                provided_secs = int(item["seconds"])
             if reasoning:
                 if not think_open:
                     think_open = True
@@ -148,12 +150,12 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
             if content:
                 if think_open and not think_closed:
                     think_closed = True
-                    secs = int(round(time.time() - t0)) if t0 else 0
+                    secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
                     yield chunk({"content": think_close(secs) + content})
                 else:
                     yield chunk({"content": content})
         if think_open and not think_closed:
-            secs = int(round(time.time() - t0)) if t0 else 0
+            secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
             yield chunk({"content": think_close(secs)})
     else:
         for delta_text in stream_text_deltas(backend, request):

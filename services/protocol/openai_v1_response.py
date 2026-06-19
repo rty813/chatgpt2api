@@ -15,8 +15,10 @@ from services.protocol.conversation import (
     count_text_tokens,
     encode_images,
     normalize_messages,
+    resolve_thinking_effort,
     stream_image_outputs_with_pool,
     stream_text_deltas,
+    stream_text_events,
     text_backend,
 )
 from services.protocol.web_search_tool import (
@@ -42,7 +44,12 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
 
+THINK_OPEN = "<think>\n"
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
+
+
+def think_close(seconds: int) -> str:
+    return f"\n\nThought for {int(seconds)}s\n</think>\n\n"
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
@@ -283,8 +290,8 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     full_text = ""
     yield response_created(response_id, model, created)
     yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
-    request = ConversationRequest(model=model, messages=messages)
-    for delta in stream_text_deltas(backend, request):
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=resolve_thinking_effort(body, model))
+    for delta in stream_response_text_deltas(backend, request):
         full_text += delta
         yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
     yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
@@ -296,6 +303,40 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
         output_text_tokens=count_text_tokens(full_text, model),
     )
     yield response_completed(response_id, model, created, [item], usage)
+
+
+def stream_response_text_deltas(backend, request: ConversationRequest) -> Iterator[str]:
+    """Responses 文本流：思考模型内联输出 <think>，普通模型只输出正文。"""
+    if not request.thinking_effort:
+        yield from stream_text_deltas(backend, request)
+        return
+
+    think_open = False
+    think_closed = False
+    t0: float | None = None
+    provided_secs = 0
+    for item in stream_text_events(backend, request):
+        reasoning = item.get("reasoning") or ""
+        content = item.get("content") or ""
+        if item.get("seconds"):
+            provided_secs = int(item["seconds"])
+        if reasoning:
+            if not think_open:
+                think_open = True
+                t0 = time.time()
+                yield THINK_OPEN + reasoning
+            else:
+                yield reasoning
+        if content:
+            if think_open and not think_closed:
+                think_closed = True
+                secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
+                yield think_close(secs) + content
+            else:
+                yield content
+    if think_open and not think_closed:
+        secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
+        yield think_close(secs)
 
 
 def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:

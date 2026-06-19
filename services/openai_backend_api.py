@@ -2556,12 +2556,19 @@ class OpenAIBackendAPI:
         return None
 
     def poll_thinking_answer(self, conversation_id: str, timeout_secs: float = 240.0) -> str:
-        """思考模型异步产出场景（artifact handoff / 多步工具调用，如生成 PPT/幻灯片、文件检索）下，
+        """轮询会话文档拿迟到的最终答案，仅返回正文（兼容旧调用）。详见 poll_thinking_result。"""
+        return (self.poll_thinking_result(conversation_id, timeout_secs) or {}).get("answer", "")
+
+    def poll_thinking_result(self, conversation_id: str, timeout_secs: float = 240.0) -> Dict[str, Any]:
+        """思考模型异步产出场景（artifact handoff / 多步工具调用，如生成 PPT/幻灯片、文件检索、浏览引用）下，
         WS 流会在最终答案产出前就结束（只剩 thoughts + 工具调用），导致正文为空。此时轮询会话文档，
-        等最终答案消息（assistant + content_type text/multimodal_text + end_turn=True）出现并返回其文本。
-        需历史未禁用（文档可访问，本服务已默认关闭隐私模式）。轮询不到返回 ""。"""
+        等最终答案消息（assistant + content_type text/multimodal_text + end_turn=True）出现，
+        并从同一份文档里一并取回思考内容（thoughts）与思考秒数（reasoning_recap "已思考 Ns"），
+        以便上层重建 <think>…Thought for Ns…</think>。需历史未禁用（文档可访问，本服务已默认关闭隐私模式）。
+        轮询不到返回 {"answer": "", "reasoning": "", "seconds": 0}。"""
+        empty = {"answer": "", "reasoning": "", "seconds": 0}
         if not conversation_id:
-            return ""
+            return empty
         deadline = time.monotonic() + timeout_secs
         while True:
             try:
@@ -2572,12 +2579,146 @@ class OpenAIBackendAPI:
             if conversation:
                 answer = self._latest_assistant_answer(conversation)
                 if answer:
-                    logger.info({"event": "thinking_answer_poll_hit", "conversation_id": conversation_id, "length": len(answer)})
-                    return answer
+                    reasoning, seconds = self._latest_assistant_reasoning(conversation)
+                    logger.info({"event": "thinking_answer_poll_hit", "conversation_id": conversation_id,
+                                 "length": len(answer), "reasoning_length": len(reasoning), "seconds": seconds})
+                    return {"answer": answer, "reasoning": reasoning, "seconds": seconds}
             if time.monotonic() >= deadline:
                 logger.warning({"event": "thinking_answer_poll_timeout", "conversation_id": conversation_id})
-                return ""
+                return empty
             time.sleep(3.0)
+
+    @staticmethod
+    def _latest_assistant_reasoning(conversation: dict) -> tuple[str, int]:
+        """从会话文档重建思考内容与秒数：
+        - 思考文本 = thoughts 节点、reasoning tool/code 节点的标题和查询摘要按 create_time 顺序拼接；
+        - 秒数 = reasoning_recap 文本（如 "已思考 14s" / "Thought for 1m 11s"）解析出的总秒数。
+        拿不到返回 ("", 0)。"""
+        thought_nodes: list[tuple[float, str]] = []
+        seconds = 0
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            if not message or ((message.get("author") or {}).get("role")) != "assistant":
+                continue
+            content = message.get("content") or {}
+            ctype = content.get("content_type")
+            create_time = float(message.get("create_time") or 0.0)
+            metadata = message.get("metadata") or {}
+            if ctype == "thoughts":
+                parts: list[str] = []
+                for th in (content.get("thoughts") or []):
+                    if not isinstance(th, dict):
+                        continue
+                    summary = str(th.get("summary") or "").strip()
+                    body = str(th.get("content") or "").strip()
+                    # 跳过上游的推广占位（summary="延长思考时间，获享更优答案"、content 为空）：
+                    # 这类节点不含真实思考，正文为空，混进 reasoning 会变成垃圾文案。
+                    if not body or "延长思考时间" in summary:
+                        continue
+                    parts.append(f"**{summary}**\n{body}" if summary else body)
+                if parts:
+                    thought_nodes.append((create_time, "\n\n".join(parts)))
+                elif isinstance(metadata, dict):
+                    activity = OpenAIBackendAPI._reasoning_activity_from_message(message)
+                    if activity:
+                        thought_nodes.append((create_time, activity))
+            elif isinstance(metadata, dict) and metadata.get("reasoning_status") == "is_reasoning":
+                activity = OpenAIBackendAPI._reasoning_activity_from_message(message)
+                if activity:
+                    thought_nodes.append((create_time, activity))
+            elif ctype == "reasoning_recap":
+                recap = content.get("content")
+                if isinstance(recap, list):
+                    recap = " ".join(str(x) for x in recap)
+                seconds = max(seconds, OpenAIBackendAPI._parse_recap_seconds(str(recap or "")))
+        thought_nodes.sort(key=lambda x: x[0])
+        seen: set[str] = set()
+        reasoning_parts: list[str] = []
+        for _t, text in thought_nodes:
+            cleaned = str(text or "").strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                reasoning_parts.append(cleaned)
+        reasoning = "\n\n".join(reasoning_parts)
+        return reasoning, seconds
+
+    @staticmethod
+    def _append_unique_text(parts: list[str], value: object) -> None:
+        text = str(value or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+
+    @staticmethod
+    def _reasoning_activity_from_message(message: dict) -> str:
+        metadata = message.get("metadata") or {}
+        content = message.get("content") or {}
+        parts: list[str] = []
+        if isinstance(metadata, dict):
+            titles = metadata.get("reasoning_titles")
+            if isinstance(titles, list):
+                for title in titles:
+                    OpenAIBackendAPI._append_unique_text(parts, title)
+            OpenAIBackendAPI._append_unique_text(parts, metadata.get("reasoning_title"))
+            query_payload = metadata.get("search_model_queries")
+            queries: list[str] = []
+            if isinstance(query_payload, dict) and isinstance(query_payload.get("queries"), list):
+                for query in query_payload["queries"]:
+                    OpenAIBackendAPI._append_unique_text(queries, query)
+            if queries:
+                parts.append("搜索：\n" + "\n".join(f"- {query}" for query in queries))
+        if isinstance(content, dict) and content.get("content_type") == "code":
+            code_text = OpenAIBackendAPI._tool_code_activity(str(content.get("text") or ""))
+            if code_text and code_text not in parts:
+                parts.append(code_text)
+        return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _tool_code_activity(text: str) -> str:
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return text.strip()
+        if not isinstance(payload, dict):
+            return text.strip()
+        parts: list[str] = []
+        for key in ("system1_search_query", "search_query"):
+            items = payload.get(key)
+            if not isinstance(items, list):
+                continue
+            queries: list[str] = []
+            for item in items:
+                if isinstance(item, dict):
+                    OpenAIBackendAPI._append_unique_text(queries, item.get("q") or item.get("query"))
+                else:
+                    OpenAIBackendAPI._append_unique_text(queries, item)
+            if queries:
+                parts.append("搜索：\n" + "\n".join(f"- {query}" for query in queries))
+        if isinstance(payload.get("open"), list):
+            refs: list[str] = []
+            for item in payload["open"]:
+                if isinstance(item, dict):
+                    OpenAIBackendAPI._append_unique_text(refs, item.get("ref_id") or item.get("url"))
+            if refs:
+                parts.append("打开资料：\n" + "\n".join(f"- {ref}" for ref in refs))
+        return "\n\n".join(parts).strip() or text.strip()
+
+    @staticmethod
+    def _parse_recap_seconds(text: str) -> int:
+        """从 "已思考 14s" / "Thought for 1m 11s" / "已思考 1分11秒" 解析总秒数；解析不到返回 0。"""
+        if not text:
+            return 0
+        minutes = re.search(r"(\d+)\s*(?:m|分|分钟|min)", text)
+        secs = re.search(r"(\d+)\s*(?:s|秒|sec)", text)
+        total = 0
+        if minutes:
+            total += int(minutes.group(1)) * 60
+        if secs:
+            total += int(secs.group(1))
+        if total == 0:
+            lone = re.search(r"(\d+)", text)
+            if lone:
+                total = int(lone.group(1))
+        return total
 
     @staticmethod
     def _latest_assistant_answer(conversation: dict) -> str:

@@ -6,6 +6,7 @@ import json
 import base64
 
 from services.config import config
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
@@ -182,6 +183,34 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(first, second)
 
+    def test_responses_stream_wraps_thinking_reasoning(self) -> None:
+        def fake_stream_text_events(_backend, _request):
+            yield {"content": "", "reasoning": "浏览当前医学信息并引用来源", "seconds": 22}
+            yield {"content": "青光眼合并白内障的治疗核心", "reasoning": "", "seconds": 22}
+
+        body = {
+            "model": "gpt-5-5-thinking",
+            "input": "青光眼合并白内障如何治疗？",
+            "stream": True,
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_events", side_effect=fake_stream_text_events),
+        ):
+            events = list(openai_v1_response.handle(body))
+
+        deltas = [
+            str(event.get("delta") or "")
+            for event in events
+            if event.get("type") == "response.output_text.delta"
+        ]
+        content = "".join(deltas)
+        self.assertIn("<think>\n浏览当前医学信息并引用来源", content)
+        self.assertIn("Thought for 22s", content)
+        self.assertIn("</think>\n\n青光眼合并白内障的治疗核心", content)
+        self.assertNotIn("## 回答:", content)
+
     def test_output_sanitizer_removes_chatgpt_annotation_markup(self) -> None:
         text = (
             "Repo: \ue200url\ue202basketikun/chatgpt2api"
@@ -225,6 +254,159 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertEqual("".join(deltas), "Repo: chatgpt2api done.")
         self.assertFalse(any("\ue200" in delta or "\ue202" in delta or "\ue201" in delta for delta in deltas))
+
+    def test_thinking_stream_emits_reasoning_recap_and_seconds(self) -> None:
+        recap = {
+            "v": {
+                "message": {
+                    "id": "reasoning-recap-1",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "reasoning_recap", "content": "已思考 1m 11s"},
+                    "metadata": {
+                        "reasoning_status": "reasoning_ended",
+                        "finished_duration_sec": 71,
+                    },
+                    "end_turn": False,
+                },
+                "conversation_id": "conv-1",
+            },
+        }
+        marker = {"type": "message_marker", "message_id": "answer-1", "marker": "final_channel_token"}
+        answer = {
+            "v": {
+                "message": {
+                    "id": "answer-1",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": ["最终结论"]},
+                    "end_turn": True,
+                },
+                "conversation_id": "conv-1",
+            },
+        }
+        payloads = [json.dumps(item, ensure_ascii=False) for item in (recap, marker, answer)] + ["[DONE]"]
+
+        deltas = [
+            event
+            for event in iter_conversation_payloads(iter(payloads), thinking=True)
+            if event.get("type") == "conversation.delta"
+        ]
+
+        self.assertEqual(deltas[0]["reasoning_delta"], "已思考 1m 11s")
+        self.assertEqual(deltas[0]["reasoning_seconds"], 71)
+        self.assertEqual(deltas[-1]["delta"], "最终结论")
+        self.assertEqual(deltas[-1]["reasoning_seconds"], 71)
+
+    def test_stream_chat_completion_wraps_recap_seconds(self) -> None:
+        def fake_stream_text_events(_backend, _request):
+            yield {"content": "", "reasoning": "已思考 1m 11s", "seconds": 71}
+            yield {"content": "最终结论", "reasoning": "", "seconds": 71}
+
+        with mock.patch("services.protocol.openai_v1_chat_complete.stream_text_events", side_effect=fake_stream_text_events):
+            chunks = list(openai_v1_chat_complete.stream_text_chat_completion(
+                object(),
+                [{"role": "user", "content": "test"}],
+                "gpt-5-5-thinking",
+                "extended",
+                emit_reasoning=True,
+            ))
+
+        content = "".join(str(chunk["choices"][0]["delta"].get("content") or "") for chunk in chunks)
+        self.assertIn("<think>\n已思考 1m 11s", content)
+        self.assertIn("Thought for 71s", content)
+        self.assertIn("</think>\n\n最终结论", content)
+        self.assertNotIn("## 回答:", content)
+
+    def test_thinking_stream_emits_reasoning_tool_activity(self) -> None:
+        code = {
+            "v": {
+                "message": {
+                    "id": "tool-call-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "web.run",
+                    "content": {
+                        "content_type": "code",
+                        "text": json.dumps({
+                            "system1_search_query": [
+                                {"q": "Docker Engine architecture containerd official docs"},
+                            ],
+                        }),
+                    },
+                    "metadata": {
+                        "reasoning_status": "is_reasoning",
+                        "reasoning_title": "查找官方文档和技术资料",
+                    },
+                    "end_turn": False,
+                },
+                "conversation_id": "conv-1",
+            },
+        }
+        marker = {"type": "message_marker", "message_id": "answer-1", "marker": "final_channel_token"}
+        answer = {
+            "v": {
+                "message": {
+                    "id": "answer-1",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": ["最终结论"]},
+                    "end_turn": True,
+                },
+                "conversation_id": "conv-1",
+            },
+        }
+        payloads = [json.dumps(item, ensure_ascii=False) for item in (code, marker, answer)] + ["[DONE]"]
+
+        deltas = [
+            event
+            for event in iter_conversation_payloads(iter(payloads), thinking=True)
+            if event.get("type") == "conversation.delta"
+        ]
+
+        reasoning = "".join(str(event.get("reasoning_delta") or "") for event in deltas)
+        self.assertIn("查找官方文档和技术资料", reasoning)
+        self.assertIn("Docker Engine architecture containerd official docs", reasoning)
+        self.assertEqual(deltas[-1]["delta"], "最终结论")
+
+    def test_conversation_poll_rebuilds_reasoning_activity_when_thoughts_are_empty(self) -> None:
+        conversation = {
+            "mapping": {
+                "thoughts": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "create_time": 1,
+                        "content": {"content_type": "thoughts", "thoughts": []},
+                        "metadata": {"reasoning_status": "is_reasoning"},
+                    },
+                },
+                "tool": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "recipient": "web.run",
+                        "create_time": 2,
+                        "content": {
+                            "content_type": "code",
+                            "text": json.dumps({"open": [{"ref_id": "turn0search0"}]}),
+                        },
+                        "metadata": {
+                            "reasoning_status": "is_reasoning",
+                            "reasoning_title": "浏览官方Docker博客和文档",
+                        },
+                    },
+                },
+                "recap": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "create_time": 3,
+                        "content": {"content_type": "reasoning_recap", "content": "已思考 11s"},
+                        "metadata": {"finished_duration_sec": 11},
+                    },
+                },
+            },
+        }
+
+        reasoning, seconds = OpenAIBackendAPI._latest_assistant_reasoning(conversation)
+
+        self.assertEqual(seconds, 11)
+        self.assertIn("浏览官方Docker博客和文档", reasoning)
+        self.assertIn("turn0search0", reasoning)
 
     def test_responses_tools_add_honest_no_tool_guard(self) -> None:
         model, messages = openai_v1_response.text_response_parts({
