@@ -894,6 +894,9 @@ def text_backend() -> OpenAIBackendAPI:
 
 
 THINKING_EMPTY_MAX_RETRIES = 2
+# 思考模型异步产出（生成 PPT/幻灯片等 artifact、多步工具）时，WS 流会先于最终答案结束 → 正文为空。
+# 此时轮询会话文档拿最终答案。这类多步任务（file_search+browsing+生成）上游实测可耗时 4 分钟以上，给足超时。
+THINKING_ANSWER_POLL_TIMEOUT_SECS = 300.0
 
 
 def _image_gen_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any]) -> str:
@@ -970,6 +973,7 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
             produced = False
+            answer_emitted = False
             last_event: dict[str, Any] = {}
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt, thinking_effort=request.thinking_effort):
                 last_event = event
@@ -978,6 +982,8 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                 if event.get("delta") or event.get("reasoning_delta"):
                     emitted = True
                     produced = True
+                    if event.get("delta"):
+                        answer_emitted = True
                     yield event
             image_markdown = _image_gen_markdown(active_backend, last_event)
             if image_markdown:
@@ -989,6 +995,19 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                 emitted = True
                 produced = True
                 yield {"type": "conversation.delta", "delta": sandbox_markdown, "reasoning_delta": ""}
+            # 思考模型异步产出（artifact handoff / 多步工具，如生成 PPT/幻灯片）：WS 流在最终答案前就结束，
+            # 正文为空。此时轮询会话文档拿迟到的最终答案。
+            if request.thinking_effort and not answer_emitted:
+                conversation_id = str(last_event.get("conversation_id") or "")
+                if conversation_id:
+                    polled_answer = active_backend.poll_thinking_answer(conversation_id, THINKING_ANSWER_POLL_TIMEOUT_SECS)
+                    if polled_answer:
+                        emitted = True
+                        produced = True
+                        answer_emitted = True
+                        account_service.mark_text_used(token)
+                        yield {"type": "conversation.delta", "delta": polled_answer, "reasoning_delta": ""}
+                        return
             account_service.mark_text_used(token)
             if produced or not request.thinking_effort or empty_retries >= THINKING_EMPTY_MAX_RETRIES:
                 return

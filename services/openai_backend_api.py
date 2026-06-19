@@ -2555,6 +2555,53 @@ class OpenAIBackendAPI:
         logger.warning({"event": "sandbox_download_failed", "conversation_id": conversation_id, "sandbox_path": sandbox_path})
         return None
 
+    def poll_thinking_answer(self, conversation_id: str, timeout_secs: float = 240.0) -> str:
+        """思考模型异步产出场景（artifact handoff / 多步工具调用，如生成 PPT/幻灯片、文件检索）下，
+        WS 流会在最终答案产出前就结束（只剩 thoughts + 工具调用），导致正文为空。此时轮询会话文档，
+        等最终答案消息（assistant + content_type text/multimodal_text + end_turn=True）出现并返回其文本。
+        需历史未禁用（文档可访问，本服务已默认关闭隐私模式）。轮询不到返回 ""。"""
+        if not conversation_id:
+            return ""
+        deadline = time.monotonic() + timeout_secs
+        while True:
+            try:
+                conversation = self._get_conversation(conversation_id)
+            except Exception as exc:
+                logger.debug({"event": "thinking_answer_poll_get_failed", "error": repr(exc)[:150]})
+                conversation = None
+            if conversation:
+                answer = self._latest_assistant_answer(conversation)
+                if answer:
+                    logger.info({"event": "thinking_answer_poll_hit", "conversation_id": conversation_id, "length": len(answer)})
+                    return answer
+            if time.monotonic() >= deadline:
+                logger.warning({"event": "thinking_answer_poll_timeout", "conversation_id": conversation_id})
+                return ""
+            time.sleep(3.0)
+
+    @staticmethod
+    def _latest_assistant_answer(conversation: dict) -> str:
+        """从会话文档里取最终答案：assistant、content_type 为 text/multimodal_text、end_turn=True、
+        正文非空，取 create_time 最大者（thoughts/reasoning_recap 等 end_turn 非 True 会被排除）。"""
+        best_text = ""
+        best_time = -1.0
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            if not message or message.get("end_turn") is not True:
+                continue
+            if ((message.get("author") or {}).get("role")) != "assistant":
+                continue
+            content = message.get("content") or {}
+            if content.get("content_type") not in ("text", "multimodal_text"):
+                continue
+            parts = content.get("parts") or []
+            text = "".join(p for p in parts if isinstance(p, str)).strip()
+            create_time = message.get("create_time") or 0.0
+            if text and create_time >= best_time:
+                best_time = create_time
+                best_text = text
+        return best_text
+
     def upload_to_transfer(self, filename: str, data: bytes) -> str:
         """把字节上传到 transfer 服务，返回可下载 URL（响应体即 URL）。直连，不走账号代理。"""
         base = (os.environ.get("TRANSFER_BASE_URL") or "https://cloud.orca-tech.cn:8082/transfer").rstrip("/")
