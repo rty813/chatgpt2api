@@ -2676,12 +2676,17 @@ class OpenAIBackendAPI:
         """思考模型链路：注册并连接 celsius WebSocket → 发起对话拿 handoff topic →
         订阅该 topic → 把推送过来的 encoded_item SSE 原样吐出（与内联流同格式，交给
         iter_conversation_payloads 解析）。WebSocket 不需要会话持久化。
+
+        WS 与对话 POST 必须用**各自独立的 session**：reader 线程的 ws.recv() 与主线程的
+        POST 若共用同一个 curl_cffi session/curl 句柄，并发 TLS 握手会损坏 OpenSSL 状态
+        （curl(35) invalid library）。故 WS 用独立的 ws_api，POST 用 self.session。
         """
-        wss_url = self._register_user_ws_url()
-        ws = self.session.ws_connect(
+        ws_api = OpenAIBackendAPI(access_token=self.access_token)
+        wss_url = ws_api._register_user_ws_url()
+        ws = ws_api.session.ws_connect(
             wss_url,
-            proxy=self._ws_proxy(),
-            headers={"Origin": self.base_url, "User-Agent": self.user_agent},
+            proxy=ws_api._ws_proxy(),
+            headers={"Origin": ws_api.base_url, "User-Agent": ws_api.user_agent},
         )
         received: "queue.Queue[Optional[str]]" = queue.Queue()
         stop = threading.Event()
@@ -2744,6 +2749,10 @@ class OpenAIBackendAPI:
             stop.set()
             try:
                 ws.close()
+            except Exception:
+                pass
+            try:
+                ws_api.session.close()
             except Exception:
                 pass
 
