@@ -850,18 +850,15 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             state.raw_text = ""
             state.text = ""
             continue
+        # 非思考模型（如 gpt-5-5）不输出 <think>：即使本轮带 thoughts 消息（常是"延长思考时间"等占位/推广文案），
+        # 也不当作 reasoning 提取，避免给普通对话塞进无意义的思考块。reasoning 仅思考分支产出。
         next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         next_text = sanitize_output_text(next_raw_text)
-        next_reasoning = assistant_reasoning_raw(event, state.reasoning)
         state.raw_text = next_raw_text
-        text_changed = next_text != state.text
-        reasoning_changed = next_reasoning != state.reasoning
-        if text_changed or reasoning_changed:
-            delta = (next_text[len(state.text):] if next_text.startswith(state.text) else next_text) if text_changed else ""
-            reasoning_delta = (next_reasoning[len(state.reasoning):] if next_reasoning.startswith(state.reasoning) else next_reasoning) if reasoning_changed else ""
+        if next_text != state.text:
+            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
             state.text = next_text
-            state.reasoning = next_reasoning
-            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta=reasoning_delta)
+            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta="")
             continue
         yield conversation_base_event("conversation.event", state, raw=event)
 
@@ -925,6 +922,36 @@ def _image_gen_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any]) -
     return build_chat_image_markdown_content({"data": items}) if items else ""
 
 
+SANDBOX_FILE_RE = re.compile(r"sandbox:(/mnt/data/[^\s\"'`)\]]+)")
+
+
+def _sandbox_download_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any]) -> str:
+    """答案里若有 sandbox:/mnt/data/... 文件引用（代码解释器产物），下载真实文件并上传到 transfer，
+    末尾追加可点击的下载链接。"""
+    text = str(last_event.get("text") or "")
+    conversation_id = str(last_event.get("conversation_id") or "")
+    if not conversation_id:
+        return ""
+    paths: list[str] = []
+    for sandbox_path in SANDBOX_FILE_RE.findall(text):
+        if sandbox_path not in paths:
+            paths.append(sandbox_path)
+    if not paths:
+        return ""
+    links: list[str] = []
+    for sandbox_path in paths:
+        data = backend.download_sandbox_file_bytes(conversation_id, sandbox_path)
+        if not data:
+            continue
+        name = sandbox_path.rsplit("/", 1)[-1] or "file"
+        url = backend.upload_to_transfer(name, data)
+        if url:
+            links.append(f"- [{name}]({url})")
+    if not links:
+        return ""
+    return "\n\n---\n📎 文件下载：\n" + "\n".join(links)
+
+
 def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[dict[str, Any]]:
     """带账号失效切换的底层流，逐个 yield conversation.delta 事件（含 delta 与 reasoning_delta）。
 
@@ -957,6 +984,11 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                 emitted = True
                 produced = True
                 yield {"type": "conversation.delta", "delta": image_markdown, "reasoning_delta": ""}
+            sandbox_markdown = _sandbox_download_markdown(active_backend, last_event)
+            if sandbox_markdown:
+                emitted = True
+                produced = True
+                yield {"type": "conversation.delta", "delta": sandbox_markdown, "reasoning_delta": ""}
             account_service.mark_text_used(token)
             if produced or not request.thinking_effort or empty_retries >= THINKING_EMPTY_MAX_RETRIES:
                 return

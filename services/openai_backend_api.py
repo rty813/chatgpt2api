@@ -2513,6 +2513,67 @@ class OpenAIBackendAPI:
         })
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
+    def download_sandbox_file_bytes(self, conversation_id: str, sandbox_path: str) -> Optional[bytes]:
+        """下载代码解释器 sandbox 文件（如 /mnt/data/xxx.html）的真实字节。
+
+        在会话里找引用该 sandbox_path 的消息 id，逐个试
+        /backend-api/conversation/{cid}/interpreter/download?message_id=&sandbox_path= 拿下载 URL 再抓字节。
+        """
+        if not conversation_id or not sandbox_path:
+            return None
+        try:
+            conversation = self._get_conversation(conversation_id)
+        except Exception as exc:
+            logger.warning({"event": "sandbox_get_conversation_failed", "conversation_id": conversation_id, "error": repr(exc)[:200]})
+            return None
+        message_ids: list[str] = []
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            mid = str(message.get("id") or "")
+            if mid and sandbox_path in json.dumps(message, ensure_ascii=False):
+                message_ids.append(mid)
+        path = f"/backend-api/conversation/{conversation_id}/interpreter/download"
+        for mid in message_ids:
+            try:
+                response = self.session.get(
+                    self.base_url + path,
+                    headers=self._headers(path, {"Accept": "application/json"}),
+                    params={"message_id": mid, "sandbox_path": sandbox_path},
+                    timeout=60,
+                )
+                if not (200 <= response.status_code < 300):
+                    continue
+                payload = response.json() or {}
+                url = str(payload.get("download_url") or payload.get("url") or "")
+                if not url:
+                    continue
+                fetched = self.session.get(url, timeout=300)
+                if 200 <= fetched.status_code < 300 and fetched.content:
+                    return fetched.content
+            except Exception as exc:
+                logger.debug({"event": "sandbox_download_attempt_failed", "sandbox_path": sandbox_path, "error": repr(exc)[:150]})
+        logger.warning({"event": "sandbox_download_failed", "conversation_id": conversation_id, "sandbox_path": sandbox_path})
+        return None
+
+    def upload_to_transfer(self, filename: str, data: bytes) -> str:
+        """把字节上传到 transfer 服务，返回可下载 URL（响应体即 URL）。直连，不走账号代理。"""
+        base = (os.environ.get("TRANSFER_BASE_URL") or "https://cloud.orca-tech.cn:8082/transfer").rstrip("/")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", filename) or "file"
+        try:
+            response = requests.put(
+                f"{base}/{safe_name}",
+                data=data,
+                timeout=180,
+                impersonate=self.fp["impersonate"],
+                verify=True,
+            )
+            if 200 <= response.status_code < 300:
+                return response.text.strip()
+            logger.warning({"event": "transfer_upload_http_error", "filename": safe_name, "status": response.status_code})
+        except Exception as exc:
+            logger.warning({"event": "transfer_upload_failed", "filename": safe_name, "error": repr(exc)[:200]})
+        return ""
+
     def resolve_conversation_image_urls(
             self,
             conversation_id: str,
