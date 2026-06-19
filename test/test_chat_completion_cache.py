@@ -46,7 +46,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
         def fake_collect_text(_backend, _request):
             nonlocal calls
             calls += 1
-            return f"cached answer {calls}"
+            return f"cached answer {calls}", "", 0
 
         body = {
             "model": "auto",
@@ -55,7 +55,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         with (
             mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
-            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text_and_reasoning", side_effect=fake_collect_text),
         ):
             first = openai_v1_chat_complete.handle(body)
             second = openai_v1_chat_complete.handle(body)
@@ -69,11 +69,11 @@ class ChatCompletionCacheTests(unittest.TestCase):
     def test_repeated_stream_text_completion_replays_cached_chunks(self) -> None:
         calls = 0
 
-        def fake_stream_text_deltas(_backend, _request):
+        def fake_stream_text_events(_backend, _request):
             nonlocal calls
             calls += 1
-            yield "streamed"
-            yield " answer"
+            yield {"content": "streamed", "reasoning": ""}
+            yield {"content": " answer", "reasoning": ""}
 
         body = {
             "model": "auto",
@@ -84,8 +84,8 @@ class ChatCompletionCacheTests(unittest.TestCase):
         with (
             mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
             mock.patch(
-                "services.protocol.openai_v1_chat_complete.stream_text_deltas",
-                side_effect=fake_stream_text_deltas,
+                "services.protocol.openai_v1_chat_complete.stream_text_events",
+                side_effect=fake_stream_text_events,
             ),
         ):
             first = list(openai_v1_chat_complete.handle(body))
@@ -101,7 +101,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         def fake_collect_text(_backend, request):
             captured_messages.extend(request.messages or [])
-            return "ok"
+            return "ok", "", 0
 
         body = {
             "model": "auto",
@@ -115,7 +115,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         with (
             mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
-            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text_and_reasoning", side_effect=fake_collect_text),
         ):
             openai_v1_chat_complete.handle(body)
 
@@ -131,7 +131,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
     def test_chat_completion_usage_includes_cached_tokens(self) -> None:
         with (
             mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
-            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value="ok"),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text_and_reasoning", return_value=("ok", "", 0)),
         ):
             response = openai_v1_chat_complete.handle({
                 "model": "auto",
@@ -366,7 +366,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
         with (
             mock.patch("services.protocol.openai_v1_chat_complete.run_web_search") as search,
             mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
-            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value="plain text answer"),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text_and_reasoning", return_value=("plain text answer", "", 0)),
         ):
             response = openai_v1_chat_complete.handle(body)
 
@@ -380,7 +380,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
             content = PNG_1X1
 
         with mock.patch("utils.helper.requests.get", return_value=FakeImageResponse()) as request_get:
-            model, messages = openai_v1_chat_complete.text_chat_parts({
+            model, messages, _thinking_effort = openai_v1_chat_complete.text_chat_parts({
                 "model": "auto",
                 "messages": [{
                     "role": "user",

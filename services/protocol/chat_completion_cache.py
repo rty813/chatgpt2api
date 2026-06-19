@@ -22,6 +22,7 @@ CACHEABLE_TEXT_KEYS = {
     "seed",
     "stop",
     "temperature",
+    "thinking_effort",
     "tool_choice",
     "tools",
     "top_p",

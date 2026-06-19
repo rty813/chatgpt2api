@@ -16,6 +16,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    build_chat_image_markdown_content,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -222,6 +223,47 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
+# 思考模型（如 gpt-5-5-thinking）默认的思考强度。
+# 已知上游对话接口唯一确认可用的 thinking_effort 取值为 "extended"。
+DEFAULT_THINKING_EFFORT = "extended"
+
+# OpenAI 标准 reasoning_effort -> ChatGPT thinking_effort 的映射。
+# 目前已确认上游仅接受 "extended"，故各档位统一映射为 extended（作为"触发思考"语义）；
+# 未来确认更多取值后可在此扩充。
+REASONING_TO_THINKING = {
+    "minimal": "extended",
+    "low": "extended",
+    "medium": "extended",
+    "high": "extended",
+    "xhigh": "extended",
+}
+
+
+def is_thinking_model(model: object) -> bool:
+    return "thinking" in str(model or "").lower()
+
+
+def resolve_thinking_effort(body: dict[str, Any] | None, model: str) -> str:
+    """根据请求体与模型名解析最终的 thinking_effort。
+
+    优先级（高→低）：
+    1. 请求体显式 `thinking_effort` -> 原样透传（客户端完全控制）。
+    2. 请求体 `reasoning_effort` -> 经 REASONING_TO_THINKING 映射。
+    3. model 名含 "thinking" -> 默认 DEFAULT_THINKING_EFFORT。
+    4. 否则 -> 空串（不发送该字段，保持原行为）。
+    """
+    body = body or {}
+    explicit = str(body.get("thinking_effort") or "").strip()
+    if explicit:
+        return explicit
+    reasoning = str(body.get("reasoning_effort") or "").strip().lower()
+    if reasoning:
+        return REASONING_TO_THINKING.get(reasoning, DEFAULT_THINKING_EFFORT)
+    if is_thinking_model(model):
+        return DEFAULT_THINKING_EFFORT
+    return ""
+
+
 def encoding_for_model(model: str):
     try:
         return tiktoken.encoding_for_model(model)
@@ -305,18 +347,26 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    thinking_effort: str = ""
 
 
 @dataclass
 class ConversationState:
     text: str = ""
     raw_text: str = ""
+    reasoning: str = ""
     conversation_id: str = ""
     file_ids: list[str] = field(default_factory=list)
     sediment_ids: list[str] = field(default_factory=list)
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    # 思考 turn 的按消息分通道跟踪（仅 thinking=True 时使用）
+    msg_order: list[str] = field(default_factory=list)
+    msg_text: dict[str, str] = field(default_factory=dict)
+    msg_kind: dict[str, str] = field(default_factory=dict)
+    final_ids: set[str] = field(default_factory=set)
+    cur_id: str = ""
 
 
 @dataclass
@@ -441,10 +491,54 @@ def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_te
         role = str((message.get("author") or {}).get("role") or "").strip().lower()
         if role != "assistant":
             continue
+        # content_type "code" 是工具调用（如图片生成的 {"size":...}），不是正文答案，跳过。
+        if (message.get("content") or {}).get("content_type") == "code":
+            continue
         text = assistant_message_text(message)
         if text:
             return strip_history(text, history_text)
     return apply_text_patch(event, current_text, history_text)
+
+
+def _join_thoughts(thoughts: list[Any]) -> str:
+    """把 thoughts 数组拼成思考文本。每项可能是字符串，或带 summary/content 的对象。"""
+    parts: list[str] = []
+    for item in thoughts:
+        if isinstance(item, str):
+            parts.append(item.strip())
+        elif isinstance(item, dict):
+            summary = str(item.get("summary") or "").strip()
+            body = str(item.get("content") or item.get("text") or "").strip()
+            if summary and body and summary != body:
+                parts.append(f"{summary}\n{body}")
+            else:
+                parts.append(body or summary)
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def assistant_reasoning_raw(event: dict[str, Any], current_reasoning: str = "") -> str:
+    """从事件里提取思考（reasoning）累计文本。
+
+    思考内容是 content_type 为 "thoughts" 的 assistant 消息，其 thoughts 数组承载推理摘要。
+    采用整快照提取：返回当前快照里的完整思考文本；没有思考快照时保持原值不变。
+    """
+    for candidate in (event, event.get("v")):
+        if not isinstance(candidate, dict):
+            continue
+        message = candidate.get("message")
+        if not isinstance(message, dict):
+            continue
+        if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, dict) or content.get("content_type") != "thoughts":
+            continue
+        thoughts = content.get("thoughts")
+        if isinstance(thoughts, list):
+            text = _join_thoughts(thoughts)
+            if text:
+                return text
+    return current_reasoning
 
 
 def assistant_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
@@ -599,6 +693,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
     return {
         "type": event_type,
         "text": state.text,
+        "reasoning": state.reasoning,
         "conversation_id": state.conversation_id,
         "file_ids": list(state.file_ids),
         "sediment_ids": list(state.sediment_ids),
@@ -609,8 +704,103 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
     }
 
 
+def _event_message(event: dict[str, Any]) -> dict[str, Any] | None:
+    """从事件里取出 message（直接挂在 event 上或在 event['v'] 里）。"""
+    message = event.get("message")
+    if isinstance(message, dict):
+        return message
+    value = event.get("v")
+    if isinstance(value, dict) and isinstance(value.get("message"), dict):
+        return value["message"]
+    return None
+
+
+def _classify_message(message: dict[str, Any]) -> str:
+    """思考 turn 的消息分类：thinking（思考/工具调用）| text（正文或预告白）| skip。"""
+    role = str((message.get("author") or {}).get("role") or "").strip().lower()
+    if role != "assistant":
+        return "skip"
+    content_type = (message.get("content") or {}).get("content_type")
+    if content_type in ("thoughts", "code"):
+        return "thinking"
+    if content_type in ("text", "multimodal_text"):
+        return "text"
+    return "skip"
+
+
+def _message_text_for_kind(message: dict[str, Any]) -> str:
+    content = message.get("content") or {}
+    if content.get("content_type") == "thoughts":
+        return _join_thoughts(content.get("thoughts") or [])
+    return assistant_message_text(message)
+
+
+def _marker_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    if event.get("type") == "message_marker":
+        return event
+    value = event.get("v")
+    if isinstance(value, dict) and value.get("type") == "message_marker":
+        return value
+    return None
+
+
+def _advance_thinking_state(state: ConversationState, event: dict[str, Any], history_text: str) -> None:
+    """更新思考 turn 的按消息跟踪状态。"""
+    marker = _marker_event(event)
+    if marker is not None:
+        if str(marker.get("marker") or "") in ("final_channel_token", "last_token"):
+            mid = str(marker.get("message_id") or "")
+            if mid:
+                state.final_ids.add(mid)
+        return
+    message = _event_message(event)
+    if isinstance(message, dict) and message.get("id"):
+        mid = str(message.get("id"))
+        kind = _classify_message(message)
+        if kind == "skip":
+            state.cur_id = ""
+            return
+        if mid not in state.msg_text:
+            state.msg_order.append(mid)
+        state.msg_kind[mid] = kind
+        state.msg_text[mid] = _message_text_for_kind(message)
+        state.cur_id = mid
+        return
+    # 没有 message 的补丁（多为正文文本的 v/p 增量），追加到当前正文消息。
+    cur = state.cur_id
+    if cur and state.msg_kind.get(cur) == "text":
+        current = state.msg_text.get(cur, "")
+        value = event.get("v")
+        if isinstance(value, str) and not event.get("p") and not event.get("o"):
+            # 裸 {"v": "..."} 追加：即便当前为空也要拼上（apply_text_patch 对空串会丢首块）。
+            state.msg_text[cur] = current + value
+        else:
+            state.msg_text[cur] = apply_text_patch(event, current, history_text)
+
+
+def _rebuild_thinking(state: ConversationState) -> tuple[str, str]:
+    """根据按消息跟踪重建 (answer_raw, reasoning)。
+
+    正文 = 被 final_channel_token/last_token 标记的消息（预告白永远不带该标记 → 始终归思考）；
+    其余 assistant 文本/思考/工具调用 → 思考。这样与到达顺序无关，不会把预告白误当正文。
+    """
+    reasoning_parts: list[str] = []
+    answer = ""
+    for mid in state.msg_order:
+        kind = state.msg_kind.get(mid)
+        text = state.msg_text.get(mid, "")
+        if not text:
+            continue
+        if kind == "text" and mid in state.final_ids:
+            answer += text
+        else:
+            reasoning_parts.append(text.strip())
+    return answer, "\n\n".join(part for part in reasoning_parts if part)
+
+
 def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
-                               history_messages: list[str] | None = None) -> Iterator[dict[str, Any]]:
+                               history_messages: list[str] | None = None,
+                               thinking: bool = False) -> Iterator[dict[str, Any]]:
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
@@ -619,6 +809,15 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         if not payload:
             continue
         if payload == "[DONE]":
+            # 兜底：思考 turn 若结束时仍未识别出正文（理论上正文都带 final/last 标记，
+            # 实测总有；此处仅防御），把最后一条文本消息当正文补发。
+            if thinking and not state.text:
+                fallback = next((state.msg_text[mid] for mid in reversed(state.msg_order)
+                                 if state.msg_kind.get(mid) == "text" and state.msg_text.get(mid)), "")
+                fallback = sanitize_output_text(fallback)
+                if fallback:
+                    state.text = fallback
+                    yield conversation_base_event("conversation.delta", state, delta=fallback, reasoning_delta="")
             yield conversation_base_event("conversation.done", state, done=True)
             break
         try:
@@ -631,6 +830,21 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
         update_conversation_state(state, payload, event)
+        if thinking:
+            _advance_thinking_state(state, event, history_text)
+            answer_raw, next_reasoning = _rebuild_thinking(state)
+            next_text = sanitize_output_text(answer_raw)
+            text_changed = next_text != state.text
+            reasoning_changed = next_reasoning != state.reasoning
+            if text_changed or reasoning_changed:
+                delta = (next_text[len(state.text):] if next_text.startswith(state.text) else next_text) if text_changed else ""
+                reasoning_delta = (next_reasoning[len(state.reasoning):] if next_reasoning.startswith(state.reasoning) else next_reasoning) if reasoning_changed else ""
+                state.text = next_text
+                state.reasoning = next_reasoning
+                yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta=reasoning_delta)
+                continue
+            yield conversation_base_event("conversation.event", state, raw=event)
+            continue
         if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
             state.raw_text = ""
@@ -638,11 +852,16 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             continue
         next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         next_text = sanitize_output_text(next_raw_text)
+        next_reasoning = assistant_reasoning_raw(event, state.reasoning)
         state.raw_text = next_raw_text
-        if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
+        text_changed = next_text != state.text
+        reasoning_changed = next_reasoning != state.reasoning
+        if text_changed or reasoning_changed:
+            delta = (next_text[len(state.text):] if next_text.startswith(state.text) else next_text) if text_changed else ""
+            reasoning_delta = (next_reasoning[len(state.reasoning):] if next_reasoning.startswith(state.reasoning) else next_reasoning) if reasoning_changed else ""
             state.text = next_text
-            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
+            state.reasoning = next_reasoning
+            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta=reasoning_delta)
             continue
         yield conversation_base_event("conversation.event", state, raw=event)
 
@@ -655,6 +874,7 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -667,34 +887,82 @@ def conversation_events(
         prompt=final_prompt,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
+        thinking_effort="" if image_model else thinking_effort,
     )
-    yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    yield from iter_conversation_payloads(payloads, history_text, history_messages, thinking=bool(thinking_effort) and not image_model)
 
 
 def text_backend() -> OpenAIBackendAPI:
     return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
 
 
-def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
+THINKING_EMPTY_MAX_RETRIES = 2
+
+
+def _image_gen_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any]) -> str:
+    """文字模型（如 gpt-5-5）在对话里自主生成图片是异步的：本轮只会返回工具调用，
+    图片随后异步产出。检测到 turn_use_case=="image gen" 后，轮询 conversation 取回图片并转成 markdown。"""
+    if str(last_event.get("turn_use_case") or "") != "image gen":
+        return ""
+    conversation_id = str(last_event.get("conversation_id") or "")
+    if not conversation_id:
+        return ""
+    try:
+        # 多图场景：轮询到全部图片到齐（而非首张即返回）。给较长上限，靠"凑齐 n / stall"提前返回。
+        urls = backend.resolve_conversation_images_all(
+            conversation_id, timeout_secs=max(config.image_poll_timeout_secs, 300.0),
+        )
+    except Exception as exc:
+        logger.warning({"event": "chat_image_resolve_failed", "conversation_id": conversation_id, "error": repr(exc)[:200]})
+        return ""
+    if not urls:
+        return ""
+    try:
+        items = [{"b64_json": base64.b64encode(data).decode("ascii")} for data in backend.download_image_bytes(urls)]
+    except Exception as exc:
+        logger.warning({"event": "chat_image_download_failed", "conversation_id": conversation_id, "error": repr(exc)[:200]})
+        return ""
+    return build_chat_image_markdown_content({"data": items}) if items else ""
+
+
+def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[dict[str, Any]]:
+    """带账号失效切换的底层流，逐个 yield conversation.delta 事件（含 delta 与 reasoning_delta）。
+
+    思考模型偶发：WS 订阅存在竞态，极快的 turn 在订阅前就把内容流完，导致这一轮收不到任何内容。
+    检测到「流正常结束但零内容」时，对思考模型用同账号重试（失败那轮没产出任何 delta，重试不会重复输出）。
+    另外：若本轮是图片生成（turn_use_case=="image gen"），异步取回图片并作为正文 markdown 追加。
+    """
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    empty_retries = 0
     while True:
-        if token and token in attempted_tokens:
+        if not token:
             raise RuntimeError("no available text account")
-        if token:
-            attempted_tokens.add(token)
+        attempted_tokens.add(token)
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
-            for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
+            produced = False
+            last_event: dict[str, Any] = {}
+            for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt, thinking_effort=request.thinking_effort):
+                last_event = event
                 if event.get("type") != "conversation.delta":
                     continue
-                delta = str(event.get("delta") or "")
-                if delta:
+                if event.get("delta") or event.get("reasoning_delta"):
                     emitted = True
-                    yield delta
+                    produced = True
+                    yield event
+            image_markdown = _image_gen_markdown(active_backend, last_event)
+            if image_markdown:
+                emitted = True
+                produced = True
+                yield {"type": "conversation.delta", "delta": image_markdown, "reasoning_delta": ""}
             account_service.mark_text_used(token)
-            return
+            if produced or not request.thinking_effort or empty_retries >= THINKING_EMPTY_MAX_RETRIES:
+                return
+            empty_retries += 1
+            logger.info({"event": "thinking_empty_stream_retry", "attempt": empty_retries})
+            continue
         except Exception as exc:
             error_message = str(exc)
             if token and not emitted and is_token_invalid_error(error_message):
@@ -709,8 +977,59 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             raise
 
 
+def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
+    """仅产出答案正文 delta（兼容既有消费者）。"""
+    last_char = ""
+    produced = False
+    for event in _stream_text_failover(backend, request):
+        delta = str(event.get("delta") or "")
+        if delta:
+            produced = True
+            last_char = delta[-1]
+            yield delta
+    # 思考模型回答结尾补一个换行，避免和后续内容/终端提示符黏在一起。
+    if request.thinking_effort and produced and last_char != "\n":
+        yield "\n"
+
+
+def stream_text_events(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[dict[str, str]]:
+    """产出 {"content", "reasoning"} 增量，供需要思考内容的 chat completion 使用。"""
+    last_char = ""
+    produced = False
+    for event in _stream_text_failover(backend, request):
+        content = str(event.get("delta") or "")
+        reasoning = str(event.get("reasoning_delta") or "")
+        if not content and not reasoning:
+            continue
+        if content:
+            produced = True
+            last_char = content[-1]
+        yield {"content": content, "reasoning": reasoning}
+    if request.thinking_effort and produced and last_char != "\n":
+        yield {"content": "\n", "reasoning": ""}
+
+
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
     return "".join(stream_text_deltas(backend, request))
+
+
+def collect_text_and_reasoning(backend: OpenAIBackendAPI, request: ConversationRequest) -> tuple[str, str, int]:
+    """返回 (正文, 思考, 思考秒数)。思考秒数 = 首个思考增量到首个正文增量的耗时。"""
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    t_reason: float | None = None
+    t_answer: float | None = None
+    for item in stream_text_events(backend, request):
+        if item.get("reasoning"):
+            if t_reason is None:
+                t_reason = time.time()
+            reasoning_parts.append(item["reasoning"])
+        if item.get("content"):
+            if t_answer is None:
+                t_answer = time.time()
+            content_parts.append(item["content"])
+    seconds = int(round(t_answer - t_reason)) if (t_reason is not None and t_answer is not None) else 0
+    return "".join(content_parts), "".join(reasoning_parts), seconds
 
 
 def _get_detailed_error_from_tasks(

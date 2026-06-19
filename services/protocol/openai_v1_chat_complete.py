@@ -16,9 +16,13 @@ from services.protocol.conversation import (
     count_message_text_tokens,
     count_text_tokens,
     encode_images,
+    collect_text_and_reasoning,
+    collect_text,
     normalize_messages,
+    resolve_thinking_effort,
     stream_image_outputs_with_pool,
     stream_text_deltas,
+    stream_text_events,
     text_backend,
 )
 from services.protocol.web_search_tool import (
@@ -42,6 +46,23 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "or file operations. Do not claim to have run tools or inspected external resources. "
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
+
+
+THINK_OPEN = "<think>\n"
+ANSWER_HEADER = "## 回答:\n\n"
+
+
+def think_close(seconds: int) -> str:
+    """思考块收尾：Thought for Ns + </think>，随后接正文标题。"""
+    return f"\n\nThought for {int(seconds)}s\n</think>\n\n{ANSWER_HEADER}"
+
+
+def wrap_think_block(reasoning: str, content: str, seconds: int = 0) -> str:
+    """把思考内容用 <think>…Thought for Ns…</think> 包起来，正文前加 ## 回答:（思考为空则原样返回正文）。"""
+    reasoning = (reasoning or "").strip()
+    if not reasoning:
+        return content
+    return f"{THINK_OPEN}{reasoning}{think_close(seconds)}{content}"
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -96,17 +117,47 @@ def completion_response(
     }
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str, thinking_effort: str = "", emit_reasoning: bool = False) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages)
-    for delta_text in stream_text_deltas(backend, request):
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+
+    def chunk(delta: dict[str, Any]):
+        nonlocal sent_role
         if not sent_role:
             sent_role = True
-            yield completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
-        else:
-            yield completion_chunk(model, {"content": delta_text}, None, completion_id, created)
+            delta = {"role": "assistant", **delta}
+        return completion_chunk(model, delta, None, completion_id, created)
+
+    if emit_reasoning:
+        # 思考内容用 <think>…Thought for Ns…</think> 内联包在正文前面，正文前加 ## 回答:。
+        think_open = False
+        think_closed = False
+        t0: float | None = None
+        for item in stream_text_events(backend, request):
+            reasoning = item.get("reasoning") or ""
+            content = item.get("content") or ""
+            if reasoning:
+                if not think_open:
+                    think_open = True
+                    t0 = time.time()
+                    yield chunk({"content": THINK_OPEN + reasoning})
+                else:
+                    yield chunk({"content": reasoning})
+            if content:
+                if think_open and not think_closed:
+                    think_closed = True
+                    secs = int(round(time.time() - t0)) if t0 else 0
+                    yield chunk({"content": think_close(secs) + content})
+                else:
+                    yield chunk({"content": content})
+        if think_open and not think_closed:
+            secs = int(round(time.time() - t0)) if t0 else 0
+            yield chunk({"content": think_close(secs)})
+    else:
+        for delta_text in stream_text_deltas(backend, request):
+            yield chunk({"content": delta_text})
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
@@ -146,12 +197,12 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
     return model, prompt, parse_image_count(body.get("n")), images
 
 
-def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
     if has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
-    return model, messages
+    return model, messages, resolve_thinking_effort(body, model)
 
 
 def chat_completion_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -263,25 +314,25 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)
-        model, messages = text_chat_parts(body)
+        model, messages, thinking_effort = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort, emit_reasoning=True),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
-    model, messages = text_chat_parts(body)
+    model, messages, thinking_effort = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     key = cache_key(body, messages, stream=False)
-    return chat_completion_cache.get_or_compute_response(
-        key,
-        lambda: completion_response(
-            model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages)),
-            messages=messages,
-        ),
-    )
+
+    def build_text_response() -> dict[str, Any]:
+        content, reasoning, seconds = collect_text_and_reasoning(
+            text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+        )
+        return completion_response(model, wrap_think_block(reasoning, content, seconds), messages=messages)
+
+    return chat_completion_cache.get_or_compute_response(key, build_text_response)

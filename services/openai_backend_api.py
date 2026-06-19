@@ -2,8 +2,10 @@ import base64
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -54,6 +56,9 @@ class ChatRequirements:
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
+# 思考模型的逐字答案通过 celsius 用户级 WebSocket 推送。
+WS_USER_REGISTER_PATH = "/backend-api/celsius/ws/user"
+WS_STREAM_TIMEOUT_SECS = 600.0
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
@@ -474,9 +479,9 @@ class OpenAIBackendAPI:
             })
         return conversation_messages
 
-    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str) -> Dict[str, Any]:
+    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str, thinking_effort: str = "") -> Dict[str, Any]:
         """把标准 messages 构造成 web 对话请求体。"""
-        return {
+        payload: Dict[str, Any] = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": model,
@@ -487,7 +492,7 @@ class OpenAIBackendAPI:
             "force_paragen_model_slug": "",
             "force_rate_limit": False,
             "force_use_sse": True,
-            "history_and_training_disabled": True,
+            "history_and_training_disabled": False,
             "reset_rate_limits": False,
             "suggestions": [],
             "supported_encodings": [],
@@ -506,6 +511,9 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
+        if thinking_effort:
+            payload["thinking_effort"] = thinking_effort
+        return payload
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
@@ -2397,6 +2405,114 @@ class OpenAIBackendAPI:
         })
         return urls
 
+    @staticmethod
+    def _conversation_turn_finished(conversation: Dict[str, Any]) -> bool:
+        """最新的 assistant 消息 end_turn==True，视为本轮已完成（多图全部到齐）。"""
+        latest: Dict[str, Any] = {}
+        latest_ct = -1.0
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            if str((message.get("author") or {}).get("role") or "").strip().lower() != "assistant":
+                continue
+            create_time = float(message.get("create_time") or 0.0)
+            if create_time >= latest_ct:
+                latest_ct = create_time
+                latest = message
+        return latest.get("end_turn") is True
+
+    @staticmethod
+    def _expected_image_count(conversation: Dict[str, Any]) -> int:
+        """从图片工具调用（content_type code 的 {"n":N}）累加期望生成的图片数；解析不到返回 0。"""
+        total = 0
+        found = False
+        for node in (conversation.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            content = message.get("content") or {}
+            if content.get("content_type") != "code":
+                continue
+            text = str(content.get("text") or "")
+            if '"n"' not in text:
+                continue
+            try:
+                n = int((json.loads(text) or {}).get("n") or 0)
+            except Exception:
+                n = 0
+            if n > 0:
+                total += n
+                found = True
+        return total if found else 0
+
+    def resolve_conversation_images_all(
+            self,
+            conversation_id: str,
+            timeout_secs: float | None = None,
+    ) -> list[str]:
+        """轮询会话取回**所有**图片 URL（用于聊天里"生成多张图"）。
+
+        与 resolve_conversation_image_urls（首张命中即返回）不同：解析工具调用里的 n 作为期望张数，
+        轮询直到 凑齐 n 张 / 本轮完成 / 连续多次无新增（上游 stall）/ 超时。
+        """
+        if not conversation_id:
+            return []
+        timeout = timeout_secs if timeout_secs is not None else config.image_poll_timeout_secs
+        start = time.time()
+        interval = float(config.image_poll_interval_secs)
+        initial_wait = float(config.image_poll_initial_wait_secs)
+        file_ids: list[str] = []
+        sediment_ids: list[str] = []
+        last_count = -1
+        no_new_polls = 0
+        expected = 0
+
+        def _remaining() -> float:
+            return timeout - (time.time() - start)
+
+        if initial_wait > 0:
+            time.sleep(min(initial_wait, max(0.0, _remaining())))
+        while _remaining() > 0:
+            try:
+                conversation = self._get_conversation(conversation_id)
+            except UpstreamHTTPError as exc:
+                if exc.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(min(interval, max(0.0, _remaining())))
+                    continue
+                raise
+            except requests.exceptions.RequestException:
+                time.sleep(min(interval, max(0.0, _remaining())))
+                continue
+            expected = max(expected, self._expected_image_count(conversation))
+            for record in self._extract_image_tool_records(conversation):
+                for file_id in record["file_ids"]:
+                    if file_id not in file_ids:
+                        file_ids.append(file_id)
+                for sediment_id in record["sediment_ids"]:
+                    if sediment_id not in sediment_ids:
+                        sediment_ids.append(sediment_id)
+            count = len(file_ids) + len(sediment_ids)
+            if count > 0:
+                if expected and count >= expected:
+                    break
+                if self._conversation_turn_finished(conversation):
+                    break
+                if count == last_count:
+                    no_new_polls += 1
+                    # 连续 ~30s 无新增（上游 stall 或仅产出部分），返回已拿到的。
+                    if no_new_polls >= 3:
+                        break
+                else:
+                    no_new_polls = 0
+            last_count = count
+            wait = min(interval, max(0.0, _remaining()))
+            if wait > 0:
+                time.sleep(wait)
+        logger.info({
+            "event": "image_poll_all_done",
+            "conversation_id": conversation_id,
+            "expected": expected,
+            "image_count": len(file_ids) + len(sediment_ids),
+        })
+        return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
+
     def resolve_conversation_image_urls(
             self,
             conversation_id: str,
@@ -2479,6 +2595,7 @@ class OpenAIBackendAPI:
             prompt: str = "",
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
+            thinking_effort: str = "",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
@@ -2489,7 +2606,13 @@ class OpenAIBackendAPI:
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone)
+        payload = self._conversation_payload(normalized, model, timezone, thinking_effort)
+        # 思考模型（thinking_effort 非空）走异步链路：上游对话接口只立即返回一个 stream_handoff，
+        # 真正的逐字答案通过 celsius 用户级 WebSocket 推送。WebSocket 不依赖会话持久化，
+        # 因此 history 可保持禁用。
+        if thinking_effort:
+            yield from self._stream_thinking_via_ws(path, requirements, payload)
+            return
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
@@ -2502,6 +2625,127 @@ class OpenAIBackendAPI:
             yield from iter_sse_payloads(response)
         finally:
             response.close()
+
+    def _register_user_ws_url(self) -> str:
+        """注册 celsius 用户级 WebSocket，返回带 verify 令牌的 wss 地址。"""
+        path = WS_USER_REGISTER_PATH
+        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "*/*"}), timeout=30)
+        ensure_ok(response, path)
+        url = str((response.json() or {}).get("websocket_url") or "")
+        if not url:
+            raise RuntimeError("missing websocket_url from celsius register")
+        return url
+
+    def _ws_proxy(self) -> Optional[str]:
+        """WebSocket 必须显式带上账号代理，否则 curl_cffi 会直连 ws.chatgpt.com 而超时。"""
+        try:
+            proxy = proxy_settings.build_session_kwargs(
+                account=self.account, impersonate=self.fp["impersonate"], verify=True
+            ).get("proxy")
+        except Exception:
+            proxy = None
+        return str(proxy) or None if proxy else None
+
+    @staticmethod
+    def _iter_ws_encoded_bodies(frame_text: str, topic: str) -> Iterator[str]:
+        """把一帧 WebSocket 消息里属于本轮 topic 的 encoded_item 拆成 SSE data 行。"""
+        try:
+            envelopes = json.loads(frame_text)
+        except Exception:
+            return
+        if isinstance(envelopes, dict):
+            envelopes = [envelopes]
+        if not isinstance(envelopes, list):
+            return
+        for envelope in envelopes:
+            if not isinstance(envelope, dict) or envelope.get("topic_id") != topic:
+                continue
+            encoded = (((envelope.get("payload") or {}).get("payload") or {}).get("encoded_item")) or ""
+            for line in str(encoded).splitlines():
+                if line.startswith("data:"):
+                    body = line[5:].strip()
+                    if body:
+                        yield body
+
+    def _stream_thinking_via_ws(
+            self,
+            path: str,
+            requirements: ChatRequirements,
+            payload: Dict[str, Any],
+    ) -> Iterator[str]:
+        """思考模型链路：注册并连接 celsius WebSocket → 发起对话拿 handoff topic →
+        订阅该 topic → 把推送过来的 encoded_item SSE 原样吐出（与内联流同格式，交给
+        iter_conversation_payloads 解析）。WebSocket 不需要会话持久化。
+        """
+        wss_url = self._register_user_ws_url()
+        ws = self.session.ws_connect(
+            wss_url,
+            proxy=self._ws_proxy(),
+            headers={"Origin": self.base_url, "User-Agent": self.user_agent},
+        )
+        received: "queue.Queue[Optional[str]]" = queue.Queue()
+        stop = threading.Event()
+
+        def reader() -> None:
+            try:
+                while not stop.is_set():
+                    data, _frame = ws.recv()
+                    if isinstance(data, (bytes, bytearray)):
+                        data = data.decode("utf-8", "replace")
+                    received.put(data)
+            except Exception:
+                pass
+            finally:
+                received.put(None)
+
+        threading.Thread(target=reader, daemon=True).start()
+        try:
+            # 连接 + 上线（presence）。
+            ws.send_str(json.dumps([{"id": 1, "command": {"type": "connect", "presence": {"type": "presence", "state": "foreground"}}}]))
+            # 发起对话，尽快从 handoff 拿到 turn topic（拿到即跳出，减少订阅延迟）。
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._conversation_headers(path, requirements),
+                json=payload,
+                timeout=120,
+                stream=True,
+            )
+            ensure_ok(response, path)
+            topic = ""
+            try:
+                for sse in iter_sse_payloads(response):
+                    try:
+                        event = json.loads(sse)
+                    except Exception:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "stream_handoff":
+                        topic = "conversation-turn-" + str(event.get("turn_exchange_id") or "")
+                        break
+            finally:
+                response.close()
+            if not topic:
+                raise RuntimeError("thinking turn did not hand off to a websocket stream")
+            # 订阅本轮 topic（offset=0 从头开始）。
+            ws.send_str(json.dumps([{"id": 2, "command": {"type": "subscribe", "topic_id": topic, "offset": "0"}}]))
+            deadline = time.time() + WS_STREAM_TIMEOUT_SECS
+            while time.time() < deadline:
+                try:
+                    data = received.get(timeout=5.0)
+                except queue.Empty:
+                    continue
+                if data is None:
+                    break
+                for body in self._iter_ws_encoded_bodies(data, topic):
+                    yield body
+                    if body == "[DONE]":
+                        return
+            raise RuntimeError("timed out waiting for thinking websocket stream")
+        finally:
+            stop.set()
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
