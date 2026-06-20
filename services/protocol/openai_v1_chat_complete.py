@@ -48,20 +48,10 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 )
 
 
-THINK_OPEN = "<think>\n"
-
-
-def think_close(seconds: int) -> str:
-    """思考块收尾：Thought for Ns + </think>，随后直接接正文。"""
-    return f"\n\nThought for {int(seconds)}s\n</think>\n\n"
-
-
-def wrap_think_block(reasoning: str, content: str, seconds: int = 0) -> str:
-    """把思考内容用 <think>…Thought for Ns…</think> 包起来；思考为空则原样返回正文。"""
+def reasoning_text(reasoning: str) -> str:
+    """Chat Completions 兼容字段里只放上游可见的思考内容，不自造时长文案。"""
     reasoning = (reasoning or "").strip()
-    if not reasoning:
-        return content
-    return f"{THINK_OPEN}{reasoning}{think_close(seconds)}{content}"
+    return reasoning
 
 
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
@@ -80,12 +70,15 @@ def completion_response(
     created: int | None = None,
     messages: list[dict[str, Any]] | None = None,
     annotations: list[dict[str, Any]] | None = None,
+    reasoning_content: str = "",
 ) -> dict[str, Any]:
     prompt_text_tokens = count_message_text_tokens(messages, model) if messages else 0
     prompt_image_tokens = count_message_image_tokens(messages, model) if messages else 0
     prompt_tokens = prompt_text_tokens + prompt_image_tokens
     completion_tokens = count_text_tokens(content, model) if messages else 0
     message = {"role": "assistant", "content": content}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     if annotations:
         message["annotations"] = annotations
     return {
@@ -130,33 +123,14 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
         return completion_chunk(model, delta, None, completion_id, created)
 
     if emit_reasoning:
-        # 思考内容用 <think>…Thought for Ns…</think> 内联包在正文前面。
-        think_open = False
-        think_closed = False
-        t0: float | None = None
-        provided_secs = 0
+        # 思考内容走 OpenAI-compatible 生态常用的 reasoning_content 字段，正文只放最终回答。
         for item in stream_text_events(backend, request):
             reasoning = item.get("reasoning") or ""
             content = item.get("content") or ""
-            if item.get("seconds"):
-                provided_secs = int(item["seconds"])
             if reasoning:
-                if not think_open:
-                    think_open = True
-                    t0 = time.time()
-                    yield chunk({"content": THINK_OPEN + reasoning})
-                else:
-                    yield chunk({"content": reasoning})
+                yield chunk({"reasoning_content": reasoning})
             if content:
-                if think_open and not think_closed:
-                    think_closed = True
-                    secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
-                    yield chunk({"content": think_close(secs) + content})
-                else:
-                    yield chunk({"content": content})
-        if think_open and not think_closed:
-            secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
-            yield chunk({"content": think_close(secs)})
+                yield chunk({"content": content})
     else:
         for delta_text in stream_text_deltas(backend, request):
             yield chunk({"content": delta_text})
@@ -335,6 +309,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         content, reasoning, seconds = collect_text_and_reasoning(
             text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
         )
-        return completion_response(model, wrap_think_block(reasoning, content, seconds), messages=messages)
+        return completion_response(
+            model,
+            content,
+            messages=messages,
+            reasoning_content=reasoning_text(reasoning),
+        )
 
     return chat_completion_cache.get_or_compute_response(key, build_text_response)

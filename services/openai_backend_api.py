@@ -2564,7 +2564,7 @@ class OpenAIBackendAPI:
         WS 流会在最终答案产出前就结束（只剩 thoughts + 工具调用），导致正文为空。此时轮询会话文档，
         等最终答案消息（assistant + content_type text/multimodal_text + end_turn=True）出现，
         并从同一份文档里一并取回思考内容（thoughts）与思考秒数（reasoning_recap "已思考 Ns"），
-        以便上层重建 <think>…Thought for Ns…</think>。需历史未禁用（文档可访问，本服务已默认关闭隐私模式）。
+        以便上层按协议输出 reasoning_content / reasoning summary。需历史未禁用（文档可访问，本服务已默认关闭隐私模式）。
         轮询不到返回 {"answer": "", "reasoning": "", "seconds": 0}。"""
         empty = {"answer": "", "reasoning": "", "seconds": 0}
         if not conversation_id:

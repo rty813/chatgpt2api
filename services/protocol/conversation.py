@@ -1042,7 +1042,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             state.raw_text = ""
             state.text = ""
             continue
-        # 非思考模型（如 gpt-5-5）不输出 <think>：即使本轮带 thoughts 消息（常是"延长思考时间"等占位/推广文案），
+        # 非思考模型（如 gpt-5-5）不输出 reasoning：即使本轮带 thoughts 消息（常是"延长思考时间"等占位/推广文案），
         # 也不当作 reasoning 提取，避免给普通对话塞进无意义的思考块。reasoning 仅思考分支产出。
         next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
         next_text = sanitize_output_text(next_raw_text)
@@ -1191,7 +1191,7 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                 produced = True
                 yield {"type": "conversation.delta", "delta": sandbox_markdown, "reasoning_delta": ""}
             # 思考模型异步产出（artifact handoff / 多步工具，如生成 PPT/幻灯片、浏览引用）：WS 流在最终答案前就结束，
-            # 正文为空。此时轮询会话文档拿迟到的最终答案，并一并取回思考内容与思考秒数，重建 <think>…Thought for Ns…</think>。
+            # 正文为空。此时轮询会话文档拿迟到的最终答案，并一并取回思考内容与思考秒数。
             if request.thinking_effort and not answer_emitted:
                 conversation_id = str(last_event.get("conversation_id") or "")
                 if conversation_id:
@@ -1204,7 +1204,7 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                         account_service.mark_text_used(token)
                         polled_reasoning = (polled or {}).get("reasoning") or ""
                         polled_seconds = int((polled or {}).get("seconds") or 0)
-                        # WS 已流出部分思考则不重复补；否则用文档里的完整思考重建 <think>。
+                        # WS 已流出部分思考则不重复补；否则用文档里的完整思考补齐 reasoning。
                         if polled_reasoning and not reasoning_emitted:
                             yield {"type": "conversation.delta", "delta": "", "reasoning_delta": polled_reasoning, "reasoning_seconds": polled_seconds}
                         yield {"type": "conversation.delta", "delta": polled_answer, "reasoning_delta": "", "reasoning_seconds": polled_seconds}

@@ -183,7 +183,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(first, second)
 
-    def test_responses_stream_wraps_thinking_reasoning(self) -> None:
+    def test_responses_stream_emits_reasoning_summary_events(self) -> None:
         def fake_stream_text_events(_backend, _request):
             yield {"content": "", "reasoning": "浏览当前医学信息并引用来源", "seconds": 22}
             yield {"content": "青光眼合并白内障的治疗核心", "reasoning": "", "seconds": 22}
@@ -200,16 +200,26 @@ class ChatCompletionCacheTests(unittest.TestCase):
         ):
             events = list(openai_v1_response.handle(body))
 
-        deltas = [
+        text_deltas = [
             str(event.get("delta") or "")
             for event in events
             if event.get("type") == "response.output_text.delta"
         ]
-        content = "".join(deltas)
-        self.assertIn("<think>\n浏览当前医学信息并引用来源", content)
-        self.assertIn("Thought for 22s", content)
-        self.assertIn("</think>\n\n青光眼合并白内障的治疗核心", content)
-        self.assertNotIn("## 回答:", content)
+        reasoning_deltas = [
+            str(event.get("delta") or "")
+            for event in events
+            if event.get("type") == "response.reasoning_summary_text.delta"
+        ]
+        content = "".join(text_deltas)
+        reasoning = "".join(reasoning_deltas)
+        self.assertEqual(content, "青光眼合并白内障的治疗核心")
+        self.assertIn("浏览当前医学信息并引用来源", reasoning)
+        self.assertNotIn("Thought for", reasoning)
+        self.assertFalse(any("<think>" in text or "</think>" in text for text in [content, reasoning]))
+        completed = [event["response"] for event in events if event.get("type") == "response.completed"][-1]
+        self.assertEqual(completed["output"][0]["type"], "reasoning")
+        self.assertEqual(completed["output"][1]["type"], "message")
+        self.assertEqual(completed["output"][1]["content"][0]["text"], "青光眼合并白内障的治疗核心")
 
     def test_output_sanitizer_removes_chatgpt_annotation_markup(self) -> None:
         text = (
@@ -311,10 +321,34 @@ class ChatCompletionCacheTests(unittest.TestCase):
             ))
 
         content = "".join(str(chunk["choices"][0]["delta"].get("content") or "") for chunk in chunks)
-        self.assertIn("<think>\n已思考 1m 11s", content)
-        self.assertIn("Thought for 71s", content)
-        self.assertIn("</think>\n\n最终结论", content)
-        self.assertNotIn("## 回答:", content)
+        reasoning = "".join(str(chunk["choices"][0]["delta"].get("reasoning_content") or "") for chunk in chunks)
+        self.assertEqual(content, "最终结论")
+        self.assertIn("已思考 1m 11s", reasoning)
+        self.assertNotIn("Thought for", reasoning)
+        self.assertNotIn("<think>", content + reasoning)
+        self.assertNotIn("</think>", content + reasoning)
+
+    def test_chat_completion_non_stream_uses_reasoning_content(self) -> None:
+        def fake_collect(_backend, _request):
+            return "最终结论", "已思考 11s", 11
+
+        body = {
+            "model": "gpt-5-5-thinking",
+            "messages": [{"role": "user", "content": "test"}],
+            "stream": False,
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text_and_reasoning", side_effect=fake_collect),
+        ):
+            response = openai_v1_chat_complete.handle(body)
+
+        message = response["choices"][0]["message"]
+        self.assertEqual(message["content"], "最终结论")
+        self.assertIn("已思考 11s", message["reasoning_content"])
+        self.assertNotIn("Thought for", message["reasoning_content"])
+        self.assertNotIn("<think>", message["content"] + message["reasoning_content"])
 
     def test_thinking_stream_emits_reasoning_tool_activity(self) -> None:
         code = {

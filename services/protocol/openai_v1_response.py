@@ -44,12 +44,12 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
     "If a user asks you to use a tool, say that tool execution is unavailable through this backend."
 )
 
-THINK_OPEN = "<think>\n"
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
 
 
-def think_close(seconds: int) -> str:
-    return f"\n\nThought for {int(seconds)}s\n</think>\n\n"
+def reasoning_text(reasoning: str) -> str:
+    reasoning = (reasoning or "").strip()
+    return reasoning
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
@@ -190,6 +190,19 @@ def text_output_item(
     }
 
 
+def reasoning_output_item(
+    text: str,
+    item_id: str | None = None,
+    status: str = "completed",
+) -> dict[str, Any]:
+    return {
+        "id": item_id or f"rs_{uuid.uuid4().hex}",
+        "type": "reasoning",
+        "status": status,
+        "summary": [{"type": "summary_text", "text": text}],
+    }
+
+
 def web_search_call_item(
     query: str,
     item_id: str | None = None,
@@ -286,57 +299,68 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
     response_id = f"resp_{uuid.uuid4().hex}"
     item_id = f"msg_{uuid.uuid4().hex}"
+    reasoning_id = f"rs_{uuid.uuid4().hex}"
     created = int(time.time())
     full_text = ""
+    full_reasoning = ""
+    reasoning_added = False
     yield response_created(response_id, model, created)
-    yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
     request = ConversationRequest(model=model, messages=messages, thinking_effort=resolve_thinking_effort(body, model))
-    for delta in stream_response_text_deltas(backend, request):
-        full_text += delta
-        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
-    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
+    text_added = False
+    text_output_index = 0
+    for item in stream_text_events(backend, request) if request.thinking_effort else ({"content": delta, "reasoning": ""} for delta in stream_text_deltas(backend, request)):
+        reasoning = item.get("reasoning") or ""
+        content = item.get("content") or ""
+        if reasoning:
+            if not reasoning_added:
+                reasoning_added = True
+                yield {"type": "response.output_item.added", "output_index": 0, "item": reasoning_output_item("", reasoning_id, "in_progress")}
+            full_reasoning += reasoning
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": reasoning_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": reasoning,
+            }
+        if content:
+            if reasoning_added and not text_added:
+                yield {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoning_id,
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": full_reasoning,
+                }
+                yield {"type": "response.output_item.done", "output_index": 0, "item": reasoning_output_item(full_reasoning, reasoning_id, "completed")}
+                text_output_index = 1
+            if not text_added:
+                text_added = True
+                yield {"type": "response.output_item.added", "output_index": text_output_index, "item": text_output_item("", item_id, "in_progress")}
+            full_text += content
+            yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": text_output_index, "content_index": 0, "delta": content}
+    if reasoning_added and not text_added:
+        yield {
+            "type": "response.reasoning_summary_text.done",
+            "item_id": reasoning_id,
+            "output_index": 0,
+            "summary_index": 0,
+            "text": full_reasoning,
+        }
+        yield {"type": "response.output_item.done", "output_index": 0, "item": reasoning_output_item(full_reasoning, reasoning_id, "completed")}
+        text_output_index = 1
+    if not text_added:
+        yield {"type": "response.output_item.added", "output_index": text_output_index, "item": text_output_item("", item_id, "in_progress")}
+    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": text_output_index, "content_index": 0, "text": full_text}
     item = text_output_item(full_text, item_id, "completed")
-    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
+    yield {"type": "response.output_item.done", "output_index": text_output_index, "item": item}
     usage = token_usage(
         input_text_tokens=count_message_text_tokens(messages, model),
         input_image_tokens=count_message_image_tokens(messages, model),
         output_text_tokens=count_text_tokens(full_text, model),
     )
-    yield response_completed(response_id, model, created, [item], usage)
-
-
-def stream_response_text_deltas(backend, request: ConversationRequest) -> Iterator[str]:
-    """Responses 文本流：思考模型内联输出 <think>，普通模型只输出正文。"""
-    if not request.thinking_effort:
-        yield from stream_text_deltas(backend, request)
-        return
-
-    think_open = False
-    think_closed = False
-    t0: float | None = None
-    provided_secs = 0
-    for item in stream_text_events(backend, request):
-        reasoning = item.get("reasoning") or ""
-        content = item.get("content") or ""
-        if item.get("seconds"):
-            provided_secs = int(item["seconds"])
-        if reasoning:
-            if not think_open:
-                think_open = True
-                t0 = time.time()
-                yield THINK_OPEN + reasoning
-            else:
-                yield reasoning
-        if content:
-            if think_open and not think_closed:
-                think_closed = True
-                secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
-                yield think_close(secs) + content
-            else:
-                yield content
-    if think_open and not think_closed:
-        secs = provided_secs or (int(round(time.time() - t0)) if t0 else 0)
-        yield think_close(secs)
+    output = [reasoning_output_item(full_reasoning, reasoning_id, "completed"), item] if reasoning_added else [item]
+    yield response_completed(response_id, model, created, output, usage)
 
 
 def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
