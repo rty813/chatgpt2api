@@ -479,8 +479,12 @@ class OpenAIBackendAPI:
             })
         return conversation_messages
 
-    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str, thinking_effort: str = "") -> Dict[str, Any]:
-        """把标准 messages 构造成 web 对话请求体。"""
+    def _conversation_payload(self, messages: list[Dict[str, Any]], model: str, timezone: str, thinking_effort: str = "", history_disabled: bool = False) -> Dict[str, Any]:
+        """把标准 messages 构造成 web 对话请求体。
+
+        `history_disabled=True` 即隐私/临时对话模式（不写入历史、不用于训练）。实测同步链路
+        （纯文本、代码解释器、快思考 WS）在该模式下正常；会话文档不可轮询（GET 404），故依赖
+        文档轮询的异步回收（生图、思考 PPT artifact）不可用——由上层据链路决定是否开启。"""
         payload: Dict[str, Any] = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
@@ -492,7 +496,7 @@ class OpenAIBackendAPI:
             "force_paragen_model_slug": "",
             "force_rate_limit": False,
             "force_use_sse": True,
-            "history_and_training_disabled": False,
+            "history_and_training_disabled": bool(history_disabled),
             "reset_rate_limits": False,
             "suggestions": [],
             "supported_encodings": [],
@@ -2513,27 +2517,30 @@ class OpenAIBackendAPI:
         })
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
-    def download_sandbox_file_bytes(self, conversation_id: str, sandbox_path: str) -> Optional[bytes]:
+    def download_sandbox_file_bytes(self, conversation_id: str, sandbox_path: str, message_ids: Optional[list[str]] = None) -> Optional[bytes]:
         """下载代码解释器 sandbox 文件（如 /mnt/data/xxx.html）的真实字节。
 
-        在会话里找引用该 sandbox_path 的消息 id，逐个试
-        /backend-api/conversation/{cid}/interpreter/download?message_id=&sandbox_path= 拿下载 URL 再抓字节。
+        逐个试 /backend-api/conversation/{cid}/interpreter/download?message_id=&sandbox_path=
+        拿下载 URL 再抓字节。`message_ids` 由调用方从 SSE/WS 流里捕获（引用该文件的 assistant/tool
+        消息 id）——优先使用它，这样隐私模式下也能下载（该定向接口实测在临时对话可用，无需会话文档）。
+        未提供时回退到读会话文档查 message id（需历史未禁用，隐私模式下会 404）。
         """
         if not conversation_id or not sandbox_path:
             return None
-        try:
-            conversation = self._get_conversation(conversation_id)
-        except Exception as exc:
-            logger.warning({"event": "sandbox_get_conversation_failed", "conversation_id": conversation_id, "error": repr(exc)[:200]})
-            return None
-        message_ids: list[str] = []
-        for node in (conversation.get("mapping") or {}).values():
-            message = (node or {}).get("message") or {}
-            mid = str(message.get("id") or "")
-            if mid and sandbox_path in json.dumps(message, ensure_ascii=False):
-                message_ids.append(mid)
+        candidate_ids: list[str] = [mid for mid in (message_ids or []) if mid]
+        if not candidate_ids:
+            try:
+                conversation = self._get_conversation(conversation_id)
+            except Exception as exc:
+                logger.warning({"event": "sandbox_get_conversation_failed", "conversation_id": conversation_id, "error": repr(exc)[:200]})
+                return None
+            for node in (conversation.get("mapping") or {}).values():
+                message = (node or {}).get("message") or {}
+                mid = str(message.get("id") or "")
+                if mid and sandbox_path in json.dumps(message, ensure_ascii=False):
+                    candidate_ids.append(mid)
         path = f"/backend-api/conversation/{conversation_id}/interpreter/download"
-        for mid in message_ids:
+        for mid in candidate_ids:
             try:
                 response = self.session.get(
                     self.base_url + path,
@@ -2845,9 +2852,12 @@ class OpenAIBackendAPI:
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
+            history_disabled: bool = False,
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
+            # 图片链路走独立的同步生成接口（_prepare/_start_image_generation），不经
+            # _conversation_payload，故隐私开关对其无效：图片仍按既有行为保留历史。
             yield from self._stream_picture_conversation(prompt, model, images or [])
             return
 
@@ -2855,7 +2865,7 @@ class OpenAIBackendAPI:
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone, thinking_effort)
+        payload = self._conversation_payload(normalized, model, timezone, thinking_effort, history_disabled=history_disabled)
         # 思考模型（thinking_effort 非空）走异步链路：上游对话接口只立即返回一个 stream_handoff，
         # 真正的逐字答案通过 celsius 用户级 WebSocket 推送。WebSocket 不依赖会话持久化，
         # 因此 history 可保持禁用。

@@ -476,6 +476,18 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def text_chat_privacy_mode(self) -> bool:
+        """文本聊天（纯文本 / 代码解释器 / 思考）启用隐私模式：上游对话请求置
+        history_and_training_disabled=true，不写入账号历史、不用于训练。实测同步内容
+        （纯文本、代码解释器、快思考）在隐私模式下正常返回；异步内容（生图、思考 artifact
+        handoff/PPT）会被上游禁用或无法回收——属预期代价。显式图片接口（/v1/images、图片模型）
+        走独立链路，不受此开关影响。默认开启。"""
+        value = self.data.get("text_chat_privacy_mode", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
     def log_levels(self) -> list[str]:
         levels = self.data.get("log_levels")
         if not isinstance(levels, list):
@@ -551,6 +563,7 @@ class ConfigStore:
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
+        data["text_chat_privacy_mode"] = self.text_chat_privacy_mode
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review

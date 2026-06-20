@@ -362,6 +362,9 @@ class ConversationState:
     blocked: bool = False
     tool_invoked: bool | None = None
     turn_use_case: str = ""
+    # 代码解释器：从流里捕获引用 sandbox:/mnt/data 文件的消息 id，供下载接口使用（隐私模式下
+    # 会话文档不可轮询，必须靠这些流内 id 走定向下载）。
+    sandbox_message_ids: list[str] = field(default_factory=list)
     # 思考 turn 的按消息分通道跟踪（仅 thinking=True 时使用）
     msg_order: list[str] = field(default_factory=list)
     msg_text: dict[str, str] = field(default_factory=dict)
@@ -858,6 +861,13 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
             if isinstance(metadata.get("tool_invoked"), bool):
                 state.tool_invoked = metadata["tool_invoked"]
             state.turn_use_case = str(metadata.get("turn_use_case") or state.turn_use_case)
+    # 捕获引用 sandbox 文件的消息 id（用于隐私模式下的代码解释器文件下载，无需读会话文档）。
+    if "sandbox:" in payload:
+        message = _event_message(event)
+        if isinstance(message, dict):
+            mid = str(message.get("id") or "")
+            if mid and mid not in state.sandbox_message_ids:
+                state.sandbox_message_ids.append(mid)
 
 
 def conversation_base_event(event_type: str, state: ConversationState, **extra: Any) -> dict[str, Any]:
@@ -872,6 +882,7 @@ def conversation_base_event(event_type: str, state: ConversationState, **extra: 
         "blocked": state.blocked,
         "tool_invoked": state.tool_invoked,
         "turn_use_case": state.turn_use_case,
+        "sandbox_message_ids": list(state.sandbox_message_ids),
         **extra,
     }
 
@@ -1070,6 +1081,9 @@ def conversation_events(
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
     final_prompt = prompt_with_global_system(build_image_prompt(prompt, size, quality)) if image_model else prompt
+    # 文本聊天链路（纯文本 / 代码解释器 / 思考）默认启用隐私模式；图片链路保持历史开启（其异步
+    # 产物需会话可轮询）。见 config.text_chat_privacy_mode。
+    history_disabled = (not image_model) and config.text_chat_privacy_mode
     payloads = backend.stream_conversation(
         messages=normalized,
         model=model,
@@ -1077,6 +1091,7 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort="" if image_model else thinking_effort,
+        history_disabled=history_disabled,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages, thinking=bool(thinking_effort) and not image_model)
 
@@ -1133,9 +1148,11 @@ def _sandbox_download_markdown(backend: OpenAIBackendAPI, last_event: dict[str, 
             paths.append(sandbox_path)
     if not paths:
         return ""
+    # 流里捕获的消息 id：隐私模式下会话文档 404，靠这些 id 走定向下载接口取文件。
+    message_ids = [str(mid) for mid in (last_event.get("sandbox_message_ids") or []) if mid]
     links: list[str] = []
     for sandbox_path in paths:
-        data = backend.download_sandbox_file_bytes(conversation_id, sandbox_path)
+        data = backend.download_sandbox_file_bytes(conversation_id, sandbox_path, message_ids=message_ids)
         if not data:
             continue
         name = sandbox_path.rsplit("/", 1)[-1] or "file"
