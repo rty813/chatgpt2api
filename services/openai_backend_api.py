@@ -65,6 +65,17 @@ SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+# Deep Research（深度研究）：connector app + venus widget，全程走 /ecosystem/call_mcp。详见 memory。
+DEEP_RESEARCH_CONNECTOR = "connectors://connector_openai_deep_research"
+DEEP_RESEARCH_HINT = "connector:connector_openai_deep_research"
+DEEP_RESEARCH_MODEL = "gpt-5-5"  # orchestrator 模型；真正触发深研的是 connector hint
+DEEP_RESEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+# 从 widget_state（JSON 字符串，可能被转义）里抠 report_message 的 id；容忍引号/反斜杠/空白
+REPORT_MESSAGE_ID_RE = re.compile(
+    r'report_message["\\:\s{]*id["\\:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+)
+# 报告正文里的私有区引用标记（…，内部 cite/turn 引用 chip，无可读内容）→ 清掉
+DEEP_RESEARCH_CITE_RE = re.compile("[^]*(?:|$)")
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
@@ -1954,6 +1965,378 @@ class OpenAIBackendAPI:
     def _clean_search_url(self, value: Any) -> str:
         return str(value or "").strip().rstrip(".,;，。；")
 
+    # ===================== Deep Research（深度研究）=====================
+    @staticmethod
+    def _deep_find(obj: Any, key: str) -> Any:
+        """返回嵌套结构里第一个匹配 key 的值（任意类型）。"""
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+            for value in obj.values():
+                found = OpenAIBackendAPI._deep_find(value, key)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = OpenAIBackendAPI._deep_find(value, key)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _parse_content_disposition_filename(value: Any) -> str:
+        text = str(value or "")
+        match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", text, re.IGNORECASE)
+        if match:
+            try:
+                return unquote(match.group(1)).strip()
+            except Exception:
+                pass
+        match = re.search(r'filename\s*=\s*"([^"]+)"', text)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    def start_deep_research(
+            self,
+            prompt: str,
+            model: str = DEEP_RESEARCH_MODEL,
+            deep_research_version: str = "standard",
+            sources: Optional[list[str]] = None,
+    ) -> Dict[str, Any]:
+        """触发深度研究并返回研究计划（尚未开始执行）。
+
+        返回 `{conversation_id, message_id, session_id, plan, ws_url}`。
+        需要随后调用 `deep_research_skip_sleep` 才会真正开跑。message_id 是承载
+        widget 的 `api_tool.call_tool` 消息 id（call_mcp 都要用它）。
+        """
+        if not self.access_token:
+            raise RuntimeError("access_token is required for deep research")
+        sources = sources or ["web"]
+        self._bootstrap()
+        # orchestrator（小模型）有时不把请求路由到深研连接器（问题偏简单/上游波动）。
+        # 用户既然显式选了深研，就重试：第一次用原文，之后用强化措辞强制走深研。
+        attempts = [prompt, self._strengthen_deep_research_prompt(prompt),
+                    self._strengthen_deep_research_prompt(prompt)]
+        last_exc: Exception | None = None
+        for index, text in enumerate(attempts):
+            try:
+                conduit_token = self._prepare_deep_research(text, model)
+                return self._kickoff_deep_research(text, conduit_token, model, deep_research_version, sources)
+            except RuntimeError as exc:
+                last_exc = exc
+                logger.info({"event": "deep_research_kickoff_retry", "attempt": index, "error": str(exc)[:160]})
+        raise RuntimeError(
+            "未能启动深度研究：上游多次未把请求路由到深度研究连接器（通常是问题过于简单或上游波动）。"
+            "请把问题描述得更具体、更需要查证后重试。"
+        ) from last_exc
+
+    @staticmethod
+    def _strengthen_deep_research_prompt(prompt: str) -> str:
+        """给原始问题套上"深度研究"指令，提升 orchestrator 路由到深研连接器的概率。"""
+        topic = (prompt or "").strip()
+        return ("请对以下主题进行深度研究（Deep Research）：广泛检索权威来源、交叉验证，"
+                "并输出一份结构化、带引用的详尽研究报告。\n\n主题：" + topic)
+
+    def _prepare_deep_research(self, prompt: str, model: str, conversation_id: str = "",
+                              parent_message_id: str = "client-created-root") -> str:
+        path = "/backend-api/f/conversation/prepare"
+        body = {
+            "action": "next", "fork_from_shared_post": False, "parent_message_id": parent_message_id,
+            "model": model, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"}, "system_hints": [DEEP_RESEARCH_HINT],
+            "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
+            "supports_buffering": True, "supported_encodings": ["v1"], "client_contextual_info": {"app_name": "chatgpt.com"},
+        }
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
+            json=body,
+            timeout=60,
+        )
+        ensure_ok(response, path)
+        token = str(response.json().get("conduit_token") or "")
+        if not token:
+            raise RuntimeError("missing conduit_token for deep research")
+        return token
+
+    def _kickoff_deep_research(self, prompt: str, conduit_token: str, model: str,
+                               deep_research_version: str, sources: list[str]) -> Dict[str, Any]:
+        requirements = self._get_chat_requirements()
+        path = "/backend-api/f/conversation"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            json={
+                "action": "next",
+                "messages": [{
+                    "id": new_uuid(), "author": {"role": "user"}, "create_time": time.time(),
+                    "content": {"content_type": "text", "parts": [prompt]},
+                    "metadata": {
+                        "system_hints": [DEEP_RESEARCH_HINT],
+                        "deep_research_version": deep_research_version,
+                        "venus_model_variant": deep_research_version,
+                        "selected_sources": sources,
+                        "caterpillar_selected_sources": sources,
+                        "selected_mcp_sources": [],
+                        "selected_github_repos": [],
+                        "serialization_metadata": {"custom_symbol_offsets": []},
+                    },
+                }],
+                "parent_message_id": "client-created-root", "model": model, "client_prepare_state": "success",
+                "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": {"kind": "primary_assistant"},
+                "enable_message_followups": True, "system_hints": [DEEP_RESEARCH_HINT], "supports_buffering": True,
+                "supported_encodings": ["v1"], "paragen_cot_summary_display_override": "allow",
+                "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 40, "page_height": 925,
+                                           "page_width": 886, "pixel_ratio": 2, "screen_height": 1440,
+                                           "screen_width": 2560, "app_name": "chatgpt.com"},
+            },
+            timeout=120, stream=True,
+        )
+        ensure_ok(response, path)
+        conversation_id = message_id = session_id = ws_url = ""
+        plan: Any = None
+        try:
+            for sse in iter_sse_payloads(response):
+                if sse == "[DONE]":
+                    break
+                try:
+                    event = json.loads(sse)
+                except Exception:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                conversation_id = conversation_id or self._find_search_value(event, "conversation_id")
+                value = event.get("v")
+                message = value.get("message") if isinstance(value, dict) else None
+                if isinstance(message, dict) and message.get("recipient") == "api_tool.call_tool":
+                    message_id = message_id or str(message.get("id") or "")
+                trm = self._deep_find(event, "tool_response_metadata")
+                if isinstance(trm, dict):
+                    session_id = session_id or str(trm.get("async_task_conversation_id") or "")
+                    ws_url = ws_url or str(trm.get("websocket_url") or "")
+                    plan = plan or trm.get("venus_plan")
+        finally:
+            response.close()
+        if not session_id or not message_id:
+            raise RuntimeError(
+                "deep research did not start (missing session_id/message_id); "
+                "upstream may not have routed to the deep research connector"
+            )
+        return {"conversation_id": conversation_id, "message_id": message_id,
+                "session_id": session_id, "plan": plan, "ws_url": ws_url}
+
+    def _deep_research_call_mcp(self, tool_name: str, conversation_id: str, message_id: str,
+                                session_id: str, extra_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """调用深研 connector 的 MCP 工具（skip_sleep / get_state / export ...）。"""
+        path = "/backend-api/ecosystem/call_mcp"
+        tool_input: Dict[str, Any] = {"session_id": session_id}
+        if extra_input:
+            tool_input.update(extra_input)
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
+            json={
+                "app_uri": DEEP_RESEARCH_CONNECTOR, "tool_name": tool_name,
+                "conversation_id": conversation_id, "message_id": message_id, "tool_input": tool_input,
+            },
+            timeout=120,
+        )
+        ensure_ok(response, path)
+        return response.json()
+
+    def deep_research_skip_sleep(self, conversation_id: str, message_id: str, session_id: str) -> Dict[str, Any]:
+        """确认计划、跳过审阅 sleep → 研究真正开跑。"""
+        return self._deep_research_call_mcp("skip_sleep", conversation_id, message_id, session_id)
+
+    def deep_research_pause(self, conversation_id: str, message_id: str, session_id: str) -> Dict[str, Any]:
+        """暂停自动开始计时器：trigger 后约 60s 不确认会自动开跑，pause 冻结它，等用户显式确认/修改。"""
+        return self._deep_research_call_mcp("pause", conversation_id, message_id, session_id)
+
+    def deep_research_edit(self, conversation_id: str, message_id: str, session_id: str,
+                           edit_text: str, plan_title: str) -> None:
+        """原地修改计划（官方动作）：pause → 往同会话发一条 targeted_reply 跟进消息。
+        提交后上游会**自动开始研究**（无需再 skip_sleep）。同一 session 复用。
+        编辑 turn 用**该账号默认模型**（pro→gpt-5-5-pro，plus→gpt-5-5-thinking），不强制 pro。"""
+        self.deep_research_pause(conversation_id, message_id, session_id)
+        doc = self._get_conversation(conversation_id)
+        parent = str(doc.get("current_node") or message_id)
+        model = str(doc.get("default_model_slug") or "gpt-5-5")  # 账号默认模型，避免给 plus 塞 pro
+        self._bootstrap()
+        conduit_token = self._prepare_deep_research(edit_text, model, conversation_id, parent)
+        requirements = self._get_chat_requirements()
+        path = "/backend-api/f/conversation"
+        body = {
+            "action": "next",
+            "messages": [
+                {"id": new_uuid(), "author": {"role": "user"}, "create_time": time.time(),
+                 "content": {"content_type": "text", "parts": [edit_text]},
+                 "metadata": {
+                     "caterpillar_selected_sources": ["web"], "selected_mcp_sources": [], "selected_sources": ["web"],
+                     "selected_github_repos": [], "selected_all_github_repos": False,
+                     "system_hints": [DEEP_RESEARCH_HINT], "deep_research_version": "standard", "venus_model_variant": "standard",
+                     "serialization_metadata": {"custom_symbol_offsets": []}, "user_timezone": "Asia/Shanghai",
+                     "targeted_reply": plan_title, "targeted_reply_label": plan_title}},
+                {"id": new_uuid(), "author": {"role": "system"},
+                 "content": {"content_type": "text", "parts": [f"The user is referring to this in particular:\n{plan_title}"]},
+                 "metadata": {"exclude_after_next_user_message": True, "is_visually_hidden_from_conversation": True}},
+            ],
+            "conversation_id": conversation_id, "parent_message_id": parent, "model": model,
+            "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"}, "enable_message_followups": True,
+            "system_hints": [DEEP_RESEARCH_HINT], "supports_buffering": True, "supported_encodings": ["v1"],
+            "paragen_cot_summary_display_override": "allow", "force_parallel_switch": "auto", "thinking_effort": "extended",
+        }
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            json=body, timeout=120, stream=True,
+        )
+        ensure_ok(response, path)
+        try:  # 排空流（拿到 handoff 即可，研究后台自动开始）
+            for sse in iter_sse_payloads(response):
+                if sse == "[DONE]":
+                    break
+        finally:
+            response.close()
+
+    def deep_research_report_ref(self, conversation_id: str) -> tuple[str, str]:
+        """报告就绪后从主会话取 `(host_message_id, report_message_id)`，未就绪返回 `("","")`。
+        承载 widget 的 `tool/code` 消息的 `metadata.chatgpt_sdk.widget_state`（**是个 JSON 字符串**，约 165KB）
+        里完成时会带 `report_message.id`；host_message_id 即该 tool/code 消息自身 id。
+        **单轮(确认)与多轮(编辑)研究都适用**——编辑流的报告不进 get_state，但这里能取到。export 用这两个 id。"""
+        try:
+            doc = self._get_conversation(conversation_id)
+        except Exception:
+            return ("", "")
+        toolcode: list[tuple[float, str, Dict[str, Any]]] = []
+        for nid, node in (doc.get("mapping") or {}).items():
+            m = (node or {}).get("message") or {}
+            if (m.get("author") or {}).get("role") == "tool" and (m.get("content") or {}).get("content_type") == "code":
+                toolcode.append((float(m.get("create_time") or 0.0), str(nid), m))
+        toolcode.sort(key=lambda x: x[0], reverse=True)  # 最新的在前
+        for _, nid, m in toolcode:
+            sdk = (m.get("metadata") or {}).get("chatgpt_sdk") or {}
+            report_id = ""
+            widget_state = sdk.get("widget_state")
+            if isinstance(widget_state, str):  # widget_state 是 JSON 字符串
+                match = REPORT_MESSAGE_ID_RE.search(widget_state)
+                if match:
+                    report_id = match.group(1)
+            elif isinstance(widget_state, dict):
+                report = self._deep_find(widget_state, "report_message")
+                report_id = str(report.get("id") or "") if isinstance(report, dict) else ""
+            if not report_id:  # 兜底：整条 metadata 里搜
+                match = REPORT_MESSAGE_ID_RE.search(json.dumps(m.get("metadata") or {}, ensure_ascii=False))
+                if match:
+                    report_id = match.group(1)
+            if report_id:
+                return (nid, report_id)
+        return ("", "")
+
+    def deep_research_report_markdown(self, conversation_id: str) -> str:
+        """取报告正文 markdown：在最新 tool/code 的 `widget_state`（JSON 字符串）→ `report_message.content.parts`。
+        清掉私有区引用 chip（…）。未就绪/取不到返回 ''。"""
+        try:
+            doc = self._get_conversation(conversation_id)
+        except Exception:
+            return ""
+        toolcode: list[tuple[float, Dict[str, Any]]] = []
+        for node in (doc.get("mapping") or {}).values():
+            m = (node or {}).get("message") or {}
+            if (m.get("author") or {}).get("role") == "tool" and (m.get("content") or {}).get("content_type") == "code":
+                toolcode.append((float(m.get("create_time") or 0.0), m))
+        toolcode.sort(key=lambda x: x[0], reverse=True)
+        for _, m in toolcode:
+            ws = ((m.get("metadata") or {}).get("chatgpt_sdk") or {}).get("widget_state")
+            if isinstance(ws, str):
+                try:
+                    ws = json.loads(ws)
+                except Exception:
+                    continue
+            if not isinstance(ws, dict):
+                continue
+            report = ws.get("report_message")
+            if not isinstance(report, dict):
+                report = self._deep_find(ws, "report_message")
+            if not isinstance(report, dict):
+                continue
+            content = report.get("content") or {}
+            parts = content.get("parts") or []
+            text = "\n".join(str(p) for p in parts if isinstance(p, str)).strip()
+            if text:
+                text = DEEP_RESEARCH_CITE_RE.sub("", text)  # 去掉引用 chip
+                return text.strip()
+        return ""
+
+    def deep_research_completion_status(self, conversation_id: str) -> str:
+        """从主会话的 `final_widget_status_signal` 读取权威完成状态：'completed' / 'failed' / ''（未完成/未知）。
+        这是网页判定深研是否结束的信号（get_state 的报告消息对多轮编辑研究不可靠，故用它兜底）。"""
+        try:
+            doc = self._get_conversation(conversation_id)
+        except Exception:
+            return ""
+        best, best_ct = "", -1.0
+        for node in (doc.get("mapping") or {}).values():
+            message = (node or {}).get("message") or {}
+            meta = message.get("metadata") or {}
+            if meta.get("venus_message_type") != "final_widget_status_signal":
+                continue
+            status = str((meta.get("venus_widget_state") or {}).get("status") or "")
+            ct = float(message.get("create_time") or 0.0)
+            if status and ct >= best_ct:
+                best, best_ct = status, ct
+        return best
+
+    def deep_research_get_state(self, conversation_id: str, message_id: str, session_id: str) -> Dict[str, Any]:
+        """轮询深研状态。返回 `{done, report_message_id, progress, activities, num_messages, sources_count}`。
+        activities = 研究过程中各步骤的概述（thoughts 的 summary，按时间顺序、去重），用于状态页展示完整进展。"""
+        data = self._deep_research_call_mcp("get_state", conversation_id, message_id, session_id)
+        meta = data.get("_meta") or data.get("meta") or {}
+        messages = meta.get("deep_research_widget_messages") or []
+        sources = meta.get("source_searches") or []
+        report_message_id = ""
+        activities: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            author = (message.get("author") or {}).get("role")
+            content = message.get("content") or {}
+            ctype = content.get("content_type")
+            if ctype == "thoughts":
+                for thought in (content.get("thoughts") or []):
+                    summary = str((thought or {}).get("summary") or "").strip()
+                    if summary and (not activities or activities[-1] != summary):
+                        activities.append(summary)
+            if (author == "assistant" and ctype == "text" and message.get("end_turn")
+                    and message.get("status") in DEEP_RESEARCH_DONE_STATUS):
+                report_message_id = str(message.get("id") or "")
+        return {
+            "done": bool(report_message_id),
+            "report_message_id": report_message_id,
+            "progress": activities[-1] if activities else "",
+            "activities": activities[-30:],  # 最近 30 步，避免无限增长
+            "num_messages": len(messages),
+            "sources_count": len(sources),
+        }
+
+    def deep_research_export(self, conversation_id: str, message_id: str, session_id: str,
+                             report_message_id: str, export_type: str = "pdf") -> tuple[bytes, str]:
+        """导出报告为文档（默认 PDF）。返回 `(bytes, filename)`。上游原生渲染。"""
+        data = self._deep_research_call_mcp(
+            "export", conversation_id, message_id, session_id,
+            extra_input={"report_message_id": report_message_id, "export_type": export_type},
+        )
+        meta = data.get("_meta") or data.get("meta") or {}
+        encoded = meta.get("encoded_data") or ""
+        if not encoded:
+            raise RuntimeError("deep research export returned no data")
+        file_bytes = base64.b64decode(encoded)
+        filename = self._parse_content_disposition_filename(meta.get("content_disposition")) or f"deep-research.{export_type}"
+        return file_bytes, filename
+
     @staticmethod
     def _add_unique(values: list[str], candidates: list[str]) -> None:
         for candidate in candidates:
@@ -2751,7 +3134,9 @@ class OpenAIBackendAPI:
         return best_text
 
     def upload_to_transfer(self, filename: str, data: bytes) -> str:
-        """把字节上传到 transfer 服务，返回可下载 URL（响应体即 URL）。直连，不走账号代理。"""
+        """把字节上传到 transfer 服务，返回**可下载 URL**。直连，不走账号代理。
+        注意：PUT 返回体里的 URL（.../transfer/{id}/{name}）是信息页，真正下载链接要在 /transfer/ 后加 /get/
+        （.../transfer/get/{id}/{name}），此处统一转成下载链接。"""
         base = (os.environ.get("TRANSFER_BASE_URL") or "https://cloud.orca-tech.cn:8082/transfer").rstrip("/")
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", filename) or "file"
         try:
@@ -2763,7 +3148,10 @@ class OpenAIBackendAPI:
                 verify=True,
             )
             if 200 <= response.status_code < 300:
-                return response.text.strip()
+                url = response.text.strip()
+                if "/transfer/" in url and "/transfer/get/" not in url:
+                    url = url.replace("/transfer/", "/transfer/get/", 1)
+                return url
             logger.warning({"event": "transfer_upload_http_error", "filename": safe_name, "status": response.status_code})
         except Exception as exc:
             logger.warning({"event": "transfer_upload_failed", "filename": safe_name, "error": repr(exc)[:200]})

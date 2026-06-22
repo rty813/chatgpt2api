@@ -119,37 +119,45 @@ def create_router() -> APIRouter:
         return await call.run(openai_v1_image_edit.handle, payload)
 
     @router.post("/v1/chat/completions")
-    async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
+    async def create_chat_completion(body: ChatCompletionRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
+        endpoint = "/v1/chat/completions"
+        if openai_v1_chat_complete.is_deep_research_request(payload):
+            endpoint = "/v1/chat/completions(deep-research)"
         call = LoggedCall(
             identity,
-            "/v1/chat/completions",
+            endpoint,
             model,
-            "文本生成",
+            "深度研究" if endpoint.endswith("(deep-research)") else "文本生成",
             request_text=request_preview,
             request_shape=request_shape(payload.get("messages")),
         )
         await filter_or_log(call, request_preview)
+        if openai_v1_chat_complete.is_deep_research_request(payload):
+            return await call.run(openai_v1_chat_complete.deep_research_chat_handle, payload, identity, resolve_image_base_url(request))
         return await call.run(openai_v1_chat_complete.handle, payload)
 
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_response(body: ResponseCreateRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
+        endpoint = "/v1/responses(deep-research)" if openai_v1_response.is_deep_research_request(payload) else "/v1/responses"
         call = LoggedCall(
             identity,
-            "/v1/responses",
+            endpoint,
             model,
-            "Responses",
+            "深度研究" if endpoint.endswith("(deep-research)") else "Responses",
             request_text=request_preview,
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
+        if openai_v1_response.is_deep_research_request(payload):
+            return await call.run(openai_v1_response.deep_research_response_handle, payload, identity, resolve_image_base_url(request))
         return await call.run(openai_v1_response.handle, payload)
 
     @router.post("/v1/messages")

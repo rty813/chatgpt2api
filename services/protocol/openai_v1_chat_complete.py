@@ -25,6 +25,8 @@ from services.protocol.conversation import (
     stream_text_events,
     text_backend,
 )
+from services.protocol import deep_research_protocol
+from services.protocol.deep_research_protocol import is_deep_research_request
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -220,6 +222,56 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
     created = int(time.time())
     yield completion_chunk(model, {"role": "assistant", "content": text}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
+
+
+def _stream_chat_message(model: str, content: str) -> Iterator[dict[str, Any]]:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    yield completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
+    yield completion_chunk(model, {}, "stop", completion_id, created)
+
+
+def _stream_chat_progress(model: str, task_id: str) -> Iterator[dict[str, Any]]:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    sent_role = False
+    for text in deep_research_protocol.iter_progress_text(task_id):
+        if not text:
+            continue
+        delta = {"content": text}
+        if not sent_role:
+            sent_role = True
+            delta = {"role": "assistant", **delta}
+        yield completion_chunk(model, delta, None, completion_id, created)
+    if not sent_role:
+        yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
+    yield completion_chunk(model, {}, "stop", completion_id, created)
+
+
+def deep_research_chat_handle(body: dict[str, Any], identity: dict[str, Any] | None = None,
+                             base_url: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
+    """深度研究的 chat completions 两轮处理（model=deep-research）。"""
+    messages = chat_messages_from_body(body)
+    model = str(body.get("model") or deep_research_protocol.DEEP_RESEARCH_MODEL)
+    stream = bool(body.get("stream"))
+    try:
+        result = deep_research_protocol.start_or_resume(identity, messages, base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    phase = result["phase"]
+    if phase == "reply":  # hi / ping 等琐碎提示 → 秒回，不进深研
+        content = result.get("text") or ""
+        return _stream_chat_message(model, content) if stream else completion_response(model, content, messages=messages)
+    task = result["task"]
+    if phase == "plan":
+        content = deep_research_protocol.render_plan_markdown(task)
+        return _stream_chat_message(model, content) if stream else completion_response(model, content, messages=messages)
+    if phase == "progress" and stream:
+        return _stream_chat_progress(model, str(task.get("id") or ""))
+    content = deep_research_protocol.status_markdown(task)
+    return _stream_chat_message(model, content) if stream else completion_response(model, content, messages=messages)
 
 
 def image_result_content(result: dict[str, Any]) -> str:

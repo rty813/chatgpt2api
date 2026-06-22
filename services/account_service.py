@@ -1000,13 +1000,16 @@ class AccountService:
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def get_text_access_token(self, excluded_tokens: set[str] | None = None,
+                              plan_type: str | None = None) -> str:
+        """轮询取一个可用文本 token。`plan_type`（如 "pro"）限定账号套餐，用于深度研究等仅 Pro 功能。"""
         excluded = set(excluded_tokens or set())
         with self._lock:
             candidates = [
                 token
                 for account in self._accounts.values()
                 if account.get("status") not in {"禁用", "异常"}
+                   and self._account_matches_plan_type(account, plan_type)
                    and (token := account.get("access_token") or "")
                    and token not in excluded
             ]

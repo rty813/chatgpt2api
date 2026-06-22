@@ -21,6 +21,8 @@ from services.protocol.conversation import (
     stream_text_events,
     text_backend,
 )
+from services.protocol import deep_research_protocol
+from services.protocol.deep_research_protocol import is_deep_research_request
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -440,6 +442,53 @@ def stream_image_response(
             yield response_completed(response_id, model, created, items, usage)
             return
     raise RuntimeError("image generation failed")
+
+
+def _stream_response_text(model: str, chunks: Iterable[str]) -> Iterator[dict[str, Any]]:
+    """把一串文本片段包成 responses 事件流（单条文本传 [text] 即可）。"""
+    response_id = f"resp_{uuid.uuid4().hex}"
+    item_id = f"msg_{uuid.uuid4().hex}"
+    created = int(time.time())
+    yield response_created(response_id, model, created)
+    yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
+    full_text = ""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        full_text += chunk
+        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": chunk}
+    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
+    item = text_output_item(full_text, item_id, "completed")
+    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
+    usage = token_usage(input_text_tokens=0, input_image_tokens=0, output_text_tokens=count_text_tokens(full_text, model))
+    yield response_completed(response_id, model, created, [item], usage)
+
+
+def deep_research_response_handle(body: dict[str, Any], identity: dict[str, Any] | None = None,
+                                 base_url: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
+    """深度研究的 responses 两轮处理（model=deep-research）。"""
+    messages = messages_from_input(body.get("input"), body.get("instructions"))
+    model = str(body.get("model") or deep_research_protocol.DEEP_RESEARCH_MODEL)
+    stream = bool(body.get("stream"))
+    try:
+        result = deep_research_protocol.start_or_resume(
+            identity, messages, base_url, fallback_prompt=extract_response_prompt(body.get("input")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+    phase = result["phase"]
+    if phase == "reply":  # hi / ping 等琐碎提示 → 秒回，不进深研
+        events = _stream_response_text(model, [result.get("text") or ""])
+        return events if stream else collect_response(events)
+    task = result["task"]
+    if phase == "progress" and stream:
+        events = _stream_response_text(model, deep_research_protocol.iter_progress_text(str(task.get("id") or "")))
+    elif phase == "plan":
+        events = _stream_response_text(model, [deep_research_protocol.render_plan_markdown(task)])
+    else:
+        events = _stream_response_text(model, [deep_research_protocol.status_markdown(task)])
+    return events if stream else collect_response(events)
 
 
 def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
