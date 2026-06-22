@@ -21,6 +21,7 @@ from services.image_service import (
     list_images,
     storage_stats,
 )
+from services.file_storage_service import file_storage_service
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
@@ -106,6 +107,12 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
+
+    @router.get("/hosted/{file_path:path}", include_in_schema=False)
+    async def get_hosted_file(file_path: str):
+        """本地托管文件下载（深度研究 PDF、代码解释器产物等），公开可访问。
+        独立于 /files（PPT/PSD 任务产物）。"""
+        return file_storage_service.get_file_response(file_path)
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):

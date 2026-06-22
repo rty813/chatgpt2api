@@ -3133,30 +3133,6 @@ class OpenAIBackendAPI:
                 best_text = text
         return best_text
 
-    def upload_to_transfer(self, filename: str, data: bytes) -> str:
-        """把字节上传到 transfer 服务，返回**可下载 URL**。直连，不走账号代理。
-        注意：PUT 返回体里的 URL（.../transfer/{id}/{name}）是信息页，真正下载链接要在 /transfer/ 后加 /get/
-        （.../transfer/get/{id}/{name}），此处统一转成下载链接。"""
-        base = (os.environ.get("TRANSFER_BASE_URL") or "https://cloud.orca-tech.cn:8082/transfer").rstrip("/")
-        safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", filename) or "file"
-        try:
-            response = requests.put(
-                f"{base}/{safe_name}",
-                data=data,
-                timeout=180,
-                impersonate=self.fp["impersonate"],
-                verify=True,
-            )
-            if 200 <= response.status_code < 300:
-                url = response.text.strip()
-                if "/transfer/" in url and "/transfer/get/" not in url:
-                    url = url.replace("/transfer/", "/transfer/get/", 1)
-                return url
-            logger.warning({"event": "transfer_upload_http_error", "filename": safe_name, "status": response.status_code})
-        except Exception as exc:
-            logger.warning({"event": "transfer_upload_failed", "filename": safe_name, "error": repr(exc)[:200]})
-        return ""
-
     def resolve_conversation_image_urls(
             self,
             conversation_id: str,

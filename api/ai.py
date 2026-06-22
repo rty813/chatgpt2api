@@ -138,7 +138,7 @@ def create_router() -> APIRouter:
         await filter_or_log(call, request_preview)
         if openai_v1_chat_complete.is_deep_research_request(payload):
             return await call.run(openai_v1_chat_complete.deep_research_chat_handle, payload, identity, resolve_image_base_url(request))
-        return await call.run(openai_v1_chat_complete.handle, payload)
+        return await call.run(openai_v1_chat_complete.handle, payload, resolve_image_base_url(request))
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, request: Request, authorization: str | None = Header(default=None)):
@@ -158,7 +158,7 @@ def create_router() -> APIRouter:
         await filter_or_log(call, request_preview)
         if openai_v1_response.is_deep_research_request(payload):
             return await call.run(openai_v1_response.deep_research_response_handle, payload, identity, resolve_image_base_url(request))
-        return await call.run(openai_v1_response.handle, payload)
+        return await call.run(openai_v1_response.handle, payload, resolve_image_base_url(request))
 
     @router.post("/v1/messages")
     async def create_message(
@@ -173,7 +173,7 @@ def create_router() -> APIRouter:
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
         call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
         await filter_or_log(call, request_preview)
-        return await call.run(anthropic_v1_messages.handle, payload, sse="anthropic")
+        return await call.run(anthropic_v1_messages.handle, payload, resolve_image_base_url(request), sse="anthropic")
 
     @router.post("/v1/search")
     async def search(body: SearchRequest, authorization: str | None = Header(default=None)):

@@ -285,7 +285,7 @@ def create_router() -> APIRouter:
 
     @router.get("/api/deep-research/{task_id}/download")
     async def deep_research_download(task_id: str):
-        """下载报告 PDF（重定向到 transfer 的下载链接）。"""
+        """下载报告 PDF（重定向到本地托管的 /files 下载链接）。"""
         task = await run_in_threadpool(deep_research_service.get_research, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail={"error": "task not found"})

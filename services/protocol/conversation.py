@@ -12,6 +12,7 @@ import tiktoken
 
 from services.account_service import account_service
 from services.config import config
+from services.file_storage_service import file_storage_service
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
@@ -1135,8 +1136,8 @@ def _image_gen_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any]) -
 SANDBOX_FILE_RE = re.compile(r"sandbox:(/mnt/data/[^\s\"'`)\]]+)")
 
 
-def _sandbox_download_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any]) -> str:
-    """答案里若有 sandbox:/mnt/data/... 文件引用（代码解释器产物），下载真实文件并上传到 transfer，
+def _sandbox_download_markdown(backend: OpenAIBackendAPI, last_event: dict[str, Any], base_url: str = "") -> str:
+    """答案里若有 sandbox:/mnt/data/... 文件引用（代码解释器产物），下载真实文件并本地托管，
     末尾追加可点击的下载链接。"""
     text = str(last_event.get("text") or "")
     conversation_id = str(last_event.get("conversation_id") or "")
@@ -1156,7 +1157,7 @@ def _sandbox_download_markdown(backend: OpenAIBackendAPI, last_event: dict[str, 
         if not data:
             continue
         name = sandbox_path.rsplit("/", 1)[-1] or "file"
-        url = backend.upload_to_transfer(name, data)
+        url = file_storage_service.save(data, name, base_url=base_url).url
         if url:
             links.append(f"- [{name}]({url})")
     if not links:
@@ -1202,7 +1203,7 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                 emitted = True
                 produced = True
                 yield {"type": "conversation.delta", "delta": image_markdown, "reasoning_delta": ""}
-            sandbox_markdown = _sandbox_download_markdown(active_backend, last_event)
+            sandbox_markdown = _sandbox_download_markdown(active_backend, last_event, request.base_url or "")
             if sandbox_markdown:
                 emitted = True
                 produced = True

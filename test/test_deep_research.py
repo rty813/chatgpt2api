@@ -192,6 +192,11 @@ class QueueSerializationTest(unittest.TestCase):
         self._orig_backend = svc_mod.OpenAIBackendAPI
         self._orig_poll = svc_mod.POLL_INTERVAL_SECS
         svc_mod.POLL_INTERVAL_SECS = 0.02
+        # 本地文件托管打桩，避免测试真的落盘
+        from types import SimpleNamespace
+        self._orig_file_store = svc_mod.file_storage_service
+        svc_mod.file_storage_service = SimpleNamespace(
+            save=lambda data, filename, base_url="": SimpleNamespace(rel="x", url="http://t/r.pdf", size=len(data)))
         acc = svc_mod.account_service
         self._orig_acc = (acc.get_text_access_token, acc.get_account, acc.refresh_access_token)
         acc.get_text_access_token = lambda **k: "tok"
@@ -217,7 +222,6 @@ class QueueSerializationTest(unittest.TestCase):
             def deep_research_report_ref(self, conv): return ("h", "r")
             def deep_research_report_markdown(self, conv): return "# 报告"
             def deep_research_export(self, *a): return (b"%PDF-1.7", "r.pdf")
-            def upload_to_transfer(self, fn, data): return "http://t/r.pdf"
             def deep_research_completion_status(self, conv): return ""
             def deep_research_get_state(self, *a):
                 return {"done": True, "report_message_id": "r", "progress": "", "activities": [],
@@ -230,6 +234,7 @@ class QueueSerializationTest(unittest.TestCase):
         self.gate.set()
         self.svc_mod.OpenAIBackendAPI = self._orig_backend
         self.svc_mod.POLL_INTERVAL_SECS = self._orig_poll
+        self.svc_mod.file_storage_service = self._orig_file_store
         acc = self.svc_mod.account_service
         acc.get_text_access_token, acc.get_account, acc.refresh_access_token = self._orig_acc
 

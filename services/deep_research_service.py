@@ -11,6 +11,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.config import DATA_DIR, config
+from services.file_storage_service import file_storage_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import OpenAIBackendAPI
 from utils.log import logger
@@ -143,6 +144,7 @@ class DeepResearchService:
             "session_id": info.get("session_id"),
             "access_token": token,
             "account_email": _clean(account.get("email")),
+            "base_url": base_url,
             "status_url": f"{base_url.rstrip('/')}/api/deep-research/{task_id}" if base_url else "",
             "progress": "",
             "num_messages": 0,
@@ -275,6 +277,7 @@ class DeepResearchService:
             started = task.get("started_ts") or time.time()
             prompt = task.get("prompt", "")
             account_email = task.get("account_email", "")
+            base_url = task.get("base_url", "")
         backend = OpenAIBackendAPI(access_token=token)
         deadline = started + MAX_RESEARCH_SECS
         report_message_id = ""
@@ -315,9 +318,9 @@ class DeepResearchService:
                 self._update(task_id, status=STATUS_EXPORTING)
                 report_md = backend.deep_research_report_markdown(conv)  # 报告正文 markdown（状态页渲染用）
                 pdf_bytes, filename = backend.deep_research_export(conv, export_host, sess, report_message_id, "pdf")
-                pdf_url = backend.upload_to_transfer(filename, pdf_bytes)
+                pdf_url = file_storage_service.save(pdf_bytes, filename, base_url=base_url).url
                 if not pdf_url:
-                    raise RuntimeError("PDF 上传 transfer 失败")
+                    raise RuntimeError("PDF 本地托管失败")
                 self._update(task_id, status=STATUS_SUCCESS, pdf_url=pdf_url, pdf_filename=filename,
                              report_message_id=report_message_id, report_markdown=report_md, error="")
                 self._log(task_id, prompt, started, "深度研究完成", account_email=account_email, pdf_url=pdf_url)

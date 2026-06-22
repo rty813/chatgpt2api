@@ -25,6 +25,7 @@ def create_app() -> FastAPI:
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
         config.cleanup_old_images()
+        config.cleanup_old_hosted_files()
         try:
             yield
         finally:

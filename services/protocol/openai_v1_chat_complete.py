@@ -111,11 +111,11 @@ def completion_response(
     }
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str, thinking_effort: str = "", emit_reasoning: bool = False) -> Iterator[dict[str, Any]]:
+def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str, thinking_effort: str = "", emit_reasoning: bool = False, base_url: str = "") -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort, base_url=base_url)
 
     def chunk(delta: dict[str, Any]):
         nonlocal sent_role
@@ -338,7 +338,7 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(body: dict[str, Any], base_url: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)
@@ -348,7 +348,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort, emit_reasoning=True),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort, emit_reasoning=True, base_url=base_url),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
@@ -359,7 +359,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
 
     def build_text_response() -> dict[str, Any]:
         content, reasoning, seconds = collect_text_and_reasoning(
-            text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+            text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort, base_url=base_url)
         )
         return completion_response(
             model,

@@ -296,7 +296,7 @@ def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]
     return model, messages
 
 
-def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
+def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None, base_url: str = "") -> Iterator[dict[str, Any]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
     response_id = f"resp_{uuid.uuid4().hex}"
@@ -307,7 +307,7 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     full_reasoning = ""
     reasoning_added = False
     yield response_created(response_id, model, created)
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=resolve_thinking_effort(body, model))
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=resolve_thinking_effort(body, model), base_url=base_url)
     text_added = False
     text_output_index = 0
     for item in stream_text_events(backend, request) if request.thinking_effort else ({"content": delta, "reasoning": ""} for delta in stream_text_deltas(backend, request)):
@@ -501,7 +501,7 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return completed
 
 
-def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+def response_events(body: dict[str, Any], base_url: str = "") -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
         if has_web_search_tool(body) and not has_unsupported_response_tools(body):
@@ -510,7 +510,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         key = cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_response(text_backend(), body, messages),
+            lambda: stream_text_response(text_backend(), body, messages, base_url=base_url),
         )
         return
 
@@ -537,8 +537,8 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    events = response_events(body)
+def handle(body: dict[str, Any], base_url: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
+    events = response_events(body, base_url)
     if body.get("stream"):
         return events
     return collect_response(events)

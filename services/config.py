@@ -393,6 +393,14 @@ class ConfigStore:
             return 30
 
     @property
+    def file_retention_days(self) -> int:
+        """本地托管文件（深度研究 PDF、代码解释器产物等）的保留天数。"""
+        try:
+            return max(1, int(self.data.get("file_retention_days", 7)))
+        except (TypeError, ValueError):
+            return 7
+
+    @property
     def image_poll_timeout_secs(self) -> int:
         try:
             return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
@@ -521,6 +529,14 @@ class ConfigStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    @property
+    def hosted_dir(self) -> Path:
+        """本地托管的通用文件（深度研究 PDF、代码解释器产物等），通过 /hosted/ 对外提供。
+        独立于 data/files（PPT/PSD 任务产物），避免清理逻辑互相误删。"""
+        path = DATA_DIR / "hosted"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def cleanup_old_images(self) -> int:
         cutoff = time.time() - self.image_retention_days * 86400
         removed = 0
@@ -529,6 +545,20 @@ class ConfigStore:
                 path.unlink()
                 removed += 1
         for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+        return removed
+
+    def cleanup_old_hosted_files(self) -> int:
+        cutoff = time.time() - self.file_retention_days * 86400
+        removed = 0
+        for path in self.hosted_dir.rglob("*"):
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        for path in sorted((p for p in self.hosted_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
             try:
                 path.rmdir()
             except OSError:
