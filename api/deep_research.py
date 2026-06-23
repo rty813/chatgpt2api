@@ -12,6 +12,96 @@ from pydantic import BaseModel, Field
 # 报告 markdown → HTML 渲染器（html=False 防注入；开启表格/删除线）
 _MD = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable("table").enable("strikethrough")
 
+# fence 渲染：mermaid / flowchart 代码块输出 <pre class="mermaid">，交给前端 mermaid.js 渲染成流程图；
+# 其他语言仍走默认代码块渲染。mermaid 加载失败时原样降级为预格式文本。
+_default_fence = _MD.renderer.rules["fence"]
+
+
+def _render_fence(tokens, idx, options, env):  # noqa: ANN001
+    token = tokens[idx]
+    info = (token.info or "").strip().split(maxsplit=1)
+    lang = info[0].lower() if info else ""
+    if lang in ("mermaid", "flowchart"):
+        return f'<pre class="mermaid">{html.escape(token.content)}</pre>\n'
+    return _default_fence(tokens, idx, options, env)
+
+
+_MD.renderer.rules["fence"] = _render_fence
+
+# mermaid.js（ESM，按需注入）：跟随系统深浅色，渲染本页 pre.mermaid；
+# 渲染完成后为每张流程图加「点击全屏放大（滚轮缩放 / 拖动平移）」与「新标签打开 SVG」。
+_MERMAID_JS = """<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme:dark)').matches;
+mermaid.initialize({startOnLoad:false, theme:dark?'dark':'default', securityLevel:'loose'});
+mermaid.run({querySelector:'pre.mermaid'}).then(enhance).catch(function(e){console.error('mermaid',e);});
+
+function enhance(){
+  document.querySelectorAll('pre.mermaid').forEach(function(pre){
+    const svg = pre.querySelector('svg');
+    if(!svg) return;
+    pre.addEventListener('click', function(){ openZoom(svg); });
+  });
+}
+
+function openZoom(srcSvg){
+  const rect = srcSvg.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const ov = document.createElement('div'); ov.className = 'mzoom';
+  const stage = document.createElement('div'); stage.className = 'mzstage';
+  const svg = srcSvg.cloneNode(true);
+  svg.style.width = rect.width + 'px';
+  svg.style.height = rect.height + 'px';
+  svg.style.maxWidth = 'none'; svg.style.maxHeight = 'none';
+  stage.appendChild(svg); ov.appendChild(stage);
+
+  const base = Math.max(0.1, Math.min(vw*0.92/rect.width, vh*0.92/rect.height));
+  let scale = base;
+  let tx = (vw - rect.width*scale)/2, ty = (vh - rect.height*scale)/2;
+  function apply(){ svg.style.transform = 'translate('+tx+'px,'+ty+'px) scale('+scale+')'; }
+  function zoomAt(cx, cy, factor){
+    const ns = Math.max(0.05, Math.min(20, scale*factor));
+    const ix = (cx - tx)/scale, iy = (cy - ty)/scale;
+    scale = ns; tx = cx - ix*scale; ty = cy - iy*scale; apply();
+  }
+  function reset(){ scale = base; tx = (vw-rect.width*scale)/2; ty = (vh-rect.height*scale)/2; apply(); }
+
+  ov.addEventListener('wheel', function(e){ e.preventDefault(); zoomAt(e.clientX, e.clientY, e.deltaY<0?1.15:1/1.15); }, {passive:false});
+  let dragging=false, moved=false, lx=0, ly=0;
+  ov.addEventListener('pointerdown', function(e){ dragging=true; moved=false; lx=e.clientX; ly=e.clientY; try{ov.setPointerCapture(e.pointerId);}catch(_){} });
+  ov.addEventListener('pointermove', function(e){ if(!dragging) return; const dx=e.clientX-lx, dy=e.clientY-ly; if(Math.abs(dx)+Math.abs(dy)>3) moved=true; tx+=dx; ty+=dy; lx=e.clientX; ly=e.clientY; apply(); });
+  ov.addEventListener('pointerup', function(){ dragging=false; });
+  ov.addEventListener('click', function(e){ if((e.target===ov||e.target===stage) && !moved) close(); });
+
+  function close(){ ov.remove(); document.removeEventListener('keydown', onKey); }
+  function onKey(e){ if(e.key==='Escape') close(); else if(e.key==='+'||e.key==='=') zoomAt(vw/2,vh/2,1.2); else if(e.key==='-') zoomAt(vw/2,vh/2,1/1.2); }
+  document.addEventListener('keydown', onKey);
+
+  const bar = document.createElement('div'); bar.className='mzbar';
+  function mk(txt, title, fn){ const b=document.createElement('button'); b.textContent=txt; b.title=title; b.addEventListener('click', function(e){ e.stopPropagation(); fn(); }); bar.appendChild(b); }
+  mk('+','放大', function(){ zoomAt(vw/2,vh/2,1.2); });
+  mk('−','缩小', function(){ zoomAt(vw/2,vh/2,1/1.2); });
+  mk('↺','重置', reset);
+  mk('↗','在新标签打开', function(){ openInTab(srcSvg); });
+  mk('✕','关闭', close);
+  ov.appendChild(bar);
+
+  const hint = document.createElement('div'); hint.className='mzhint';
+  hint.textContent = '滚轮缩放 · 拖动平移 · Esc 关闭';
+  ov.appendChild(hint);
+
+  document.body.appendChild(ov); apply();
+}
+
+function openInTab(srcSvg){
+  try{
+    const s = new XMLSerializer().serializeToString(srcSvg);
+    const blob = new Blob([s], {type:'image/svg+xml;charset=utf-8'});
+    window.open(URL.createObjectURL(blob), '_blank', 'noopener');
+  }catch(e){ console.error('open svg', e); }
+}
+</script>"""
+
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.deep_research_service import deep_research_service
@@ -73,6 +163,16 @@ iframe.pdf{width:100%;height:82vh;border:1px solid var(--border);border-radius:1
 .report code{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:.9em;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .report pre{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;overflow:auto}
 .report pre code{background:none;padding:0}
+.report pre.mermaid{position:relative;background:none;border:none;padding:8px 0;text-align:center;overflow:auto;line-height:normal;cursor:zoom-in}
+.report pre.mermaid svg{max-width:100%;height:auto}
+.report pre.mermaid::after{content:"🔍 点击放大";position:absolute;top:4px;right:6px;font-size:11px;color:var(--muted);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:1px 7px;opacity:.8;pointer-events:none}
+.mzoom{position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.86);overflow:hidden;touch-action:none;user-select:none}
+.mzoom .mzstage{position:absolute;inset:0}
+.mzoom svg{position:absolute;left:0;top:0;transform-origin:0 0;cursor:grab}
+.mzoom .mzbar{position:fixed;top:14px;right:16px;display:flex;gap:8px;z-index:100000}
+.mzoom .mzbar button{min-width:40px;height:40px;padding:0 10px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:10px;font-size:18px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.mzoom .mzbar button:hover{background:rgba(255,255,255,.3)}
+.mzoom .mzhint{position:fixed;bottom:16px;left:0;right:0;text-align:center;color:rgba(255,255,255,.72);font-size:12.5px;pointer-events:none}
 .report blockquote{margin:12px 0;padding:4px 16px;border-left:3px solid var(--accent);color:var(--muted)}
 .report table{border-collapse:collapse;margin:14px 0;font-size:14px;display:block;overflow-x:auto;max-width:100%}
 .report th,.report td{border:1px solid var(--border);padding:8px 12px;text-align:left;vertical-align:top}
@@ -149,10 +249,12 @@ def _render_status_html(task: dict[str, Any]) -> str:
                 fn = _esc(task.get("pdf_filename") or "report.pdf")
                 buttons = (f'<a class="btn" href="{pdf}" download>📄 下载 PDF</a>'
                            f'<a class="btn ghost" href="{pdf}" target="_blank" rel="noopener">PDF 预览</a>')
+            report_html = _MD.render(md)
             inner = (head
                      + f'<p style="margin:18px 0 10px">参考来源 {srcs} 条。</p>'
                      + buttons
-                     + f'<div class="report">{_MD.render(md)}</div>')
+                     + f'<div class="report">{report_html}</div>'
+                     + (_MERMAID_JS if 'class="mermaid"' in report_html else ""))
         elif pdf:  # 无 markdown 但有 PDF → 退回内嵌 PDF 预览
             fn = _esc(task.get("pdf_filename") or "report.pdf")
             inner = (head
