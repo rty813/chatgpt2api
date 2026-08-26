@@ -70,6 +70,12 @@ DEEP_RESEARCH_CONNECTOR = "connectors://connector_openai_deep_research"
 DEEP_RESEARCH_HINT = "connector:connector_openai_deep_research"
 DEEP_RESEARCH_MODEL = "gpt-5-5"  # orchestrator 模型；真正触发深研的是 connector hint
 DEEP_RESEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
+# 主会话 widget 宿主 tool/code 的 widget_state.status 的终止（非成功）取值：被停止/作废/失败。
+# 'user_stopped' 实测＝计划长时间未确认被上游自动作废（或用户在 ChatGPT 手动停止）。完成不在此列（走 report_ref）。
+DEEP_RESEARCH_STOP_STATUSES = {
+    "user_stopped", "stopped", "aborted", "cancelled", "canceled",
+    "failed", "error", "errored", "expired", "timed_out", "interrupted",
+}
 # 从 widget_state（JSON 字符串，可能被转义）里抠 report_message 的 id；容忍引号/反斜杠/空白
 REPORT_MESSAGE_ID_RE = re.compile(
     r'report_message["\\:\s{]*id["\\:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
@@ -2269,6 +2275,33 @@ class OpenAIBackendAPI:
             if text:
                 text = DEEP_RESEARCH_CITE_RE.sub("", text)  # 去掉引用 chip
                 return text.strip()
+        return ""
+
+    def deep_research_widget_status(self, conversation_id: str) -> str:
+        """读主会话 widget 宿主 `tool/code` 的 `widget_state.status`（运行态真值，权威且实时）。
+        已知终止值见 `DEEP_RESEARCH_STOP_STATUSES`（如 `user_stopped`＝长时间未确认被作废/被停止）；
+        运行中/计划中等返回对应字符串，取不到返回 ''。完成判定仍走 `deep_research_report_ref`。"""
+        try:
+            doc = self._get_conversation(conversation_id)
+        except Exception:
+            return ""
+        toolcode: list[tuple[float, Dict[str, Any]]] = []
+        for node in (doc.get("mapping") or {}).values():
+            m = (node or {}).get("message") or {}
+            if (m.get("author") or {}).get("role") == "tool" and (m.get("content") or {}).get("content_type") == "code":
+                toolcode.append((float(m.get("create_time") or 0.0), m))
+        toolcode.sort(key=lambda x: x[0], reverse=True)  # 最新的在前
+        for _, m in toolcode:
+            ws = ((m.get("metadata") or {}).get("chatgpt_sdk") or {}).get("widget_state")
+            if isinstance(ws, str):
+                try:
+                    ws = json.loads(ws)
+                except Exception:
+                    continue
+            if isinstance(ws, dict):
+                status = str(ws.get("status") or "").strip().lower()
+                if status:
+                    return status
         return ""
 
     def deep_research_completion_status(self, conversation_id: str) -> str:

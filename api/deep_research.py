@@ -9,8 +9,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
 
-# 报告 markdown → HTML 渲染器（html=False 防注入；开启表格/删除线）
+from utils.markdown_math import KATEX_HEAD, KATEX_JS, MATH_CSS, has_math, install_math
+
+# 报告 markdown → HTML 渲染器（html=False 防注入；开启表格/删除线；\( \) \[ \] 公式交给 KaTeX）
 _MD = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable("table").enable("strikethrough")
+install_math(_MD)
 
 # fence 渲染：mermaid / flowchart 代码块输出 <pre class="mermaid">，交给前端 mermaid.js 渲染成流程图；
 # 其他语言仍走默认代码块渲染。mermaid 加载失败时原样降级为预格式文本。
@@ -180,7 +183,7 @@ iframe.pdf{width:100%;height:82vh;border:1px solid var(--border);border-radius:1
 .report a{color:var(--accent);text-decoration:none}.report a:hover{text-decoration:underline}
 .report img{max-width:100%}
 .report hr{border:none;border-top:1px solid var(--border);margin:22px 0}
-"""
+""" + MATH_CSS
 
 _BADGES = {
     "awaiting_confirmation": ("wait", "⏸ 等待确认"),
@@ -192,12 +195,12 @@ _BADGES = {
 }
 
 
-def _page(inner: str, auto_refresh: bool) -> str:
+def _page(inner: str, auto_refresh: bool, head_extra: str = "") -> str:
     refresh = '<meta http-equiv="refresh" content="8">' if auto_refresh else ""
     foot = "本页每 8 秒自动刷新" if auto_refresh else "深度研究 · 最终结果"
     return (f'<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">{refresh}'
-            f'<title>深度研究</title><style>{_CSS}</style></head>'
+            f'<title>深度研究</title><style>{_CSS}</style>{head_extra}</head>'
             f'<body><div class="wrap"><div class="card">{inner}</div>'
             f'<p class="foot">{foot}</p></div></body></html>')
 
@@ -243,6 +246,7 @@ def _render_status_html(task: dict[str, Any]) -> str:
         pdf = _esc(task.get("pdf_url"))
         md = task.get("report_markdown") or ""
         srcs = _esc(task.get("sources_count") or 0)
+        head_extra = ""
         if md:  # 首选：渲染 markdown 正文（阅读体验最好），附 PDF 下载
             buttons = ""
             if pdf:
@@ -250,11 +254,14 @@ def _render_status_html(task: dict[str, Any]) -> str:
                 buttons = (f'<a class="btn" href="{pdf}" download>📄 下载 PDF</a>'
                            f'<a class="btn ghost" href="{pdf}" target="_blank" rel="noopener">PDF 预览</a>')
             report_html = _MD.render(md)
+            math = has_math(report_html)  # 含公式时才加载 KaTeX（样式表进 <head>，脚本随正文）
+            head_extra = KATEX_HEAD if math else ""
             inner = (head
                      + f'<p style="margin:18px 0 10px">参考来源 {srcs} 条。</p>'
                      + buttons
                      + f'<div class="report">{report_html}</div>'
-                     + (_MERMAID_JS if 'class="mermaid"' in report_html else ""))
+                     + (_MERMAID_JS if 'class="mermaid"' in report_html else "")
+                     + (KATEX_JS if math else ""))
         elif pdf:  # 无 markdown 但有 PDF → 退回内嵌 PDF 预览
             fn = _esc(task.get("pdf_filename") or "report.pdf")
             inner = (head
@@ -267,10 +274,13 @@ def _render_status_html(task: dict[str, Any]) -> str:
             inner = (head
                      + f'<p style="margin:20px 0 6px">{_esc(task.get("report_note") or "研究已完成。")}</p>'
                      + (f'<a class="btn" href="{cg}" target="_blank" rel="noopener">在 ChatGPT 查看报告</a>' if cg else ""))
-        return _page(inner, False)
+        return _page(inner, False, head_extra)
 
     if status == "error":
-        return _page(head + f'<div class="err">{_esc(task.get("error") or "未知错误")}</div>', False)
+        cg = _esc(task.get("chatgpt_url"))
+        link = (f'<a class="btn ghost" href="{cg}" target="_blank" rel="noopener" '
+                f'style="margin-top:14px">在 ChatGPT 查看</a>' if cg else "")
+        return _page(head + f'<div class="err">{_esc(task.get("error") or "未知错误")}</div>' + link, False)
 
     if status in ("running", "exporting"):
         elapsed = task.get("elapsed_secs")

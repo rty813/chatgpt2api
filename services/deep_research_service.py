@@ -13,7 +13,7 @@ from services.account_service import account_service
 from services.config import DATA_DIR, config
 from services.file_storage_service import file_storage_service
 from services.log_service import LOG_TYPE_CALL, log_service
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import DEEP_RESEARCH_STOP_STATUSES, OpenAIBackendAPI
 from utils.log import logger
 
 # 状态机：等待确认 → 排队 → 运行中 → 导出中 → 成功 / 失败
@@ -27,9 +27,11 @@ TERMINAL_STATUSES = {STATUS_SUCCESS, STATUS_ERROR}
 UNFINISHED_STATUSES = {STATUS_AWAITING, STATUS_QUEUED, STATUS_RUNNING, STATUS_EXPORTING}
 
 DEEP_RESEARCH_PLAN_TYPE = "pro"  # 深度研究仅 Pro 账号
-POLL_INTERVAL_SECS = 15.0
+POLL_INTERVAL_SECS = 30.0
 MAX_RESEARCH_SECS = 2400.0  # 40 分钟上限
 REPORT_GRACE_SECS = 120.0  # 收到完成信号后，再宽限多久等 get_state 出现可导出的报告消息
+STALL_NO_START_SECS = 480.0  # 开跑后这么久仍无任何研究消息（停在"准备研究"）→ 判定已停止/未开始，别傻等到 40min
+AWAITING_EXPIRE_SECS = 1800.0  # awaiting 阶段被 pause 冻结超过这么久 → 上游多半已作废会话，标记过期、拒绝确认（窗口未知，按需调）
 RETENTION_DAYS = 7
 
 
@@ -181,6 +183,8 @@ class DeepResearchService:
                 raise PermissionError("not your task")
             if task.get("status") in (STATUS_QUEUED, STATUS_RUNNING, STATUS_EXPORTING):
                 return self._public_with_queue_locked(task)  # 幂等：已在队列/运行中
+            if self._maybe_expire_awaiting_locked(task):
+                raise ValueError(task.get("error") or "研究计划已过期，请重新发起")
             if task.get("status") != STATUS_AWAITING:
                 raise ValueError(f"task is not awaiting confirmation (status={task.get('status')})")
             task["status"] = STATUS_QUEUED
@@ -198,11 +202,17 @@ class DeepResearchService:
         """按 task_id 取状态（capability：task_id 即 uuid，状态页无需鉴权）。"""
         with self._lock:
             task = self._tasks.get(_clean(task_id))
-            return self._public_with_queue_locked(task) if task else None
+            if not task:
+                return None
+            self._maybe_expire_awaiting_locked(task)
+            return self._public_with_queue_locked(task)
 
     def list_research(self, identity: dict[str, object]) -> list[dict[str, Any]]:
         owner = _owner_id(identity)
         with self._lock:
+            for t in self._tasks.values():
+                if t.get("owner_id") == owner:
+                    self._maybe_expire_awaiting_locked(t)
             items = [self._public_with_queue_locked(t) for t in self._tasks.values() if t.get("owner_id") == owner]
         items.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
         return items
@@ -280,15 +290,19 @@ class DeepResearchService:
             base_url = task.get("base_url", "")
         backend = OpenAIBackendAPI(access_token=token)
         deadline = started + MAX_RESEARCH_SECS
+        no_start_deadline = started + STALL_NO_START_SECS
         report_message_id = ""
         export_host = msg
         signal_completed_at: float | None = None
+        saw_progress = False  # 是否真正开始产出研究消息/活动（用于识别"停在准备研究"的已停止任务）
         try:
             while time.time() < deadline:
                 time.sleep(POLL_INTERVAL_SECS)
                 # 进度（仅展示用，best-effort）
                 try:
                     state = backend.deep_research_get_state(conv, msg, sess)
+                    if state.get("num_messages") or state.get("activities"):
+                        saw_progress = True
                     self._update(task_id, progress=_clean(state.get("progress")),
                                  activities=state.get("activities") or [],
                                  num_messages=state.get("num_messages", 0),
@@ -300,15 +314,33 @@ class DeepResearchService:
                 if report_id:
                     report_message_id, export_host = report_id, (host_id or msg)
                     break
-                # 兜底：主会话权威完成信号，防卡死
+                # 权威实时判定：widget_state.status 出现终止值（user_stopped / 被作废 / 失败）→ 立刻结束，不等超时。
+                # 这是「计划长时间未确认被上游作废」唯一可靠的接口信号（既无 final_widget_status_signal、async_status 也为 null）。
+                wstatus = backend.deep_research_widget_status(conv)
+                if wstatus in DEEP_RESEARCH_STOP_STATUSES:
+                    self._update(task_id, chatgpt_url=f"https://chatgpt.com/c/{conv}")
+                    raise RuntimeError(f"研究已停止（{wstatus}）：可能是计划长时间未确认被上游作废，"
+                                       "或在 ChatGPT 中被停止，未生成报告。请重新发起这次深度研究。")
+                # 兜底：主会话权威完成信号（final_widget_status_signal，终态才出现）防卡死
                 signal = backend.deep_research_completion_status(conv)
-                if signal == "failed":
-                    raise RuntimeError("上游报告：深度研究失败")
                 if signal == "completed":
                     if signal_completed_at is None:
                         signal_completed_at = time.time()  # 宽限期，等报告引用出现
                     elif time.time() - signal_completed_at >= REPORT_GRACE_SECS:
                         break
+                elif signal:
+                    # 非空且非 completed 的终态信号 = 失败 / 被用户在 ChatGPT 中停止 / 取消
+                    self._update(task_id, chatgpt_url=f"https://chatgpt.com/c/{conv}")
+                    if signal == "failed":
+                        raise RuntimeError("上游报告：深度研究失败")
+                    raise RuntimeError(f"研究已在 ChatGPT 中停止或中断（{signal}），未生成报告")
+                # 兜底：开跑后迟迟无任何研究消息（一直停在"准备研究"）→ 会话多半已失效，别傻等到 40min。
+                # 常见原因：计划在 awaiting 阶段被 pause 冻结太久，上游已把该研究会话自动作废，
+                # 此时确认(skip_sleep)虽返回成功却永远不开跑。
+                if not saw_progress and time.time() >= no_start_deadline:
+                    self._update(task_id, chatgpt_url=f"https://chatgpt.com/c/{conv}")
+                    raise RuntimeError("研究迟迟未开始：研究计划可能因长时间未确认已被上游作废（或已在 ChatGPT 中停止），"
+                                       "请重新发起这次深度研究。")
             # 收尾再取一次报告引用（宽限期内可能刚出现）
             if not report_message_id:
                 host_id, report_id = backend.deep_research_report_ref(conv)
@@ -336,6 +368,23 @@ class DeepResearchService:
             self._update(task_id, status=STATUS_ERROR, error=str(exc) or "deep research failed")
             self._log(task_id, prompt, started, "深度研究失败", status="failed",
                       error=str(exc), account_email=account_email)
+
+    def _maybe_expire_awaiting_locked(self, task: dict[str, Any]) -> bool:
+        """awaiting 阶段被 pause 冻结太久，上游会把研究会话自动作废（实测 widget_state.status→user_stopped）；
+        超过 AWAITING_EXPIRE_SECS 仍未确认 → 就地标记过期，避免确认进一个已死会话。须持锁调用。返回是否已过期。"""
+        if task.get("status") != STATUS_AWAITING:
+            return False
+        created = task.get("created_ts") or _timestamp(task.get("created_at"))
+        if not created or time.time() - created < AWAITING_EXPIRE_SECS:
+            return False
+        task["status"] = STATUS_ERROR
+        task["error"] = (f"研究计划已过期：超过 {int(AWAITING_EXPIRE_SECS // 60)} 分钟未确认，"
+                         "上游可能已作废该会话，请重新发起这次深度研究。")
+        if task.get("conversation_id"):
+            task["chatgpt_url"] = f"https://chatgpt.com/c/{task['conversation_id']}"
+        _touch(task)
+        self._save_locked()
+        return True
 
     # ---------- internals ----------
     def _update(self, task_id: str, **updates: Any) -> None:
