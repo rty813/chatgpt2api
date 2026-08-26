@@ -1002,17 +1002,30 @@ class AccountService:
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None,
                               plan_type: str | None = None) -> str:
-        """轮询取一个可用文本 token。`plan_type`（如 "pro"）限定账号套餐，用于深度研究等仅 Pro 功能。"""
+        """轮询取一个可用文本 token。
+
+        未指定套餐时，普通文本对话优先使用 Plus，尽量保留 Pro 给深度研究等 Pro-only 功能。
+        `plan_type`（如 "pro"）会严格限定账号套餐。
+        """
         excluded = set(excluded_tokens or set())
         with self._lock:
-            candidates = [
-                token
+            accounts = [
+                account
                 for account in self._accounts.values()
                 if account.get("status") not in {"禁用", "异常"}
                    and self._account_matches_plan_type(account, plan_type)
-                   and (token := account.get("access_token") or "")
-                   and token not in excluded
+                   and (access_token := str(account.get("access_token") or ""))
+                   and access_token not in excluded
             ]
+            if plan_type:
+                candidates = [str(account.get("access_token") or "") for account in accounts]
+            else:
+                plus_candidates = [
+                    str(account.get("access_token") or "")
+                    for account in accounts
+                    if self._account_matches_plan_type(account, "plus")
+                ]
+                candidates = plus_candidates or [str(account.get("access_token") or "") for account in accounts]
             if not candidates:
                 return ""
             access_token = candidates[self._index % len(candidates)]

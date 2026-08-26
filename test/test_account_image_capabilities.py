@@ -97,6 +97,51 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_text_access_token_prefers_plus_without_plan_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3},
+                    {"access_token": "token-plus", "type": "Plus", "status": "正常", "quota": 3},
+                ]
+            )
+            service.refresh_access_token = lambda access_token, **_: access_token
+
+            token = service.get_text_access_token()
+
+            self.assertEqual(token, "token-plus")
+
+    def test_text_access_token_falls_back_when_plus_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3},
+                    {"access_token": "token-plus", "type": "Plus", "status": "异常", "quota": 3},
+                ]
+            )
+            service.refresh_access_token = lambda access_token, **_: access_token
+
+            token = service.get_text_access_token()
+
+            self.assertEqual(token, "token-pro")
+
+    def test_text_access_token_respects_explicit_pro_plan_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "token-plus", "type": "Plus", "status": "正常", "quota": 3},
+                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3},
+                ]
+            )
+            service.refresh_access_token = lambda access_token, **_: access_token
+
+            token = service.get_text_access_token(plan_type="pro")
+
+            self.assertEqual(token, "token-pro")
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True
