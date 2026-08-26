@@ -3230,11 +3230,9 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort, history_disabled=history_disabled)
-        # 思考模型（thinking_effort 非空）走异步链路：上游对话接口只立即返回一个 stream_handoff，
-        # 真正的逐字答案通过 celsius 用户级 WebSocket 推送。WebSocket 不依赖会话持久化，
-        # 因此 history 可保持禁用。
+        # 思考模型（thinking_effort 非空）：内联优先、stream_handoff 兜底，见 _stream_thinking_turn。
         if thinking_effort:
-            yield from self._stream_thinking_via_ws(path, requirements, payload)
+            yield from self._stream_thinking_turn(path, requirements, payload)
             return
         response = self.session.post(
             self.base_url + path,
@@ -3290,19 +3288,61 @@ class OpenAIBackendAPI:
                     if body:
                         yield body
 
-    def _stream_thinking_via_ws(
+    def _stream_thinking_turn(
             self,
             path: str,
             requirements: ChatRequirements,
             payload: Dict[str, Any],
     ) -> Iterator[str]:
-        """思考模型链路：注册并连接 celsius WebSocket → 发起对话拿 handoff topic →
-        订阅该 topic → 把推送过来的 encoded_item SSE 原样吐出（与内联流同格式，交给
-        iter_conversation_payloads 解析）。WebSocket 不需要会话持久化。
+        """思考模型链路：**内联优先，stream_handoff 兜底**。
 
-        WS 与对话 POST 必须用**各自独立的 session**：reader 线程的 ws.recv() 与主线程的
-        POST 若共用同一个 curl_cffi session/curl 句柄，并发 TLS 握手会损坏 OpenSSL 状态
-        （curl(35) invalid library）。故 WS 用独立的 ws_api，POST 用 self.session。
+        上游早先的行为是：思考 turn 的 POST 立刻返回一个 `stream_handoff`（正文为空），真正的
+        逐字答案只走 celsius 用户级 WebSocket 推送。2026-08 实测 `gpt-5-5-thinking` 与
+        `gpt-5-6-thinking` 都已改为**直接内联流式返回**（trivial 与重推理 prompt 均如此），
+        不再发 `stream_handoff`。旧实现「只找 handoff、其余事件一律丢弃、找不到就抛错」于是把
+        完整答案丢掉并报 `thinking turn did not hand off to a websocket stream`。
+
+        故改为：内联事件原样吐出（与 WS encoded_item 同格式，都交给 iter_conversation_payloads
+        解析）；只有真收到 `stream_handoff` 时，才注册并连接 WebSocket 续流。WS 改为按需建立，
+        普通内联轮次因此零额外开销，也避免了 WS reader 线程与对话 POST 并发导致的
+        curl(35) TLS 句柄污染。
+        """
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._conversation_headers(path, requirements),
+            json=payload,
+            timeout=300,
+            stream=True,
+        )
+        ensure_ok(response, path)
+        topic = ""
+        try:
+            for sse in iter_sse_payloads(response):
+                if sse == "[DONE]":
+                    yield sse
+                    return
+                try:
+                    event = json.loads(sse)
+                except Exception:
+                    yield sse
+                    continue
+                if isinstance(event, dict) and event.get("type") == "stream_handoff":
+                    # handoff 轮次：正文不在内联流里。必须立刻跳出去订阅（offset:"0" 是 live-only
+                    # 不回放，订阅晚了会错过快 turn 的内容）。内联流后面只剩 [DONE]，丢弃即可。
+                    topic = "conversation-turn-" + str(event.get("turn_exchange_id") or "")
+                    break
+                yield sse
+        finally:
+            response.close()
+        if topic:
+            yield from self._stream_ws_topic(topic)
+
+    def _stream_ws_topic(self, topic: str) -> Iterator[str]:
+        """订阅 celsius 用户级 WebSocket 上的某个 turn topic，把推送过来的 encoded_item SSE
+        原样吐出（与内联流同格式）。WebSocket 不需要会话持久化。
+
+        WS 必须用**独立的 session**：reader 线程的 ws.recv() 与主线程的请求若共用同一个
+        curl_cffi session/curl 句柄，并发 TLS 握手会损坏 OpenSSL 状态（curl(35) invalid library）。
         """
         ws_api = OpenAIBackendAPI(access_token=self.access_token)
         wss_url = ws_api._register_user_ws_url()
@@ -3328,32 +3368,8 @@ class OpenAIBackendAPI:
 
         threading.Thread(target=reader, daemon=True).start()
         try:
-            # 连接 + 上线（presence）。
+            # 连接 + 上线（presence），随后订阅本轮 topic（offset=0 从头开始）。
             ws.send_str(json.dumps([{"id": 1, "command": {"type": "connect", "presence": {"type": "presence", "state": "foreground"}}}]))
-            # 发起对话，尽快从 handoff 拿到 turn topic（拿到即跳出，减少订阅延迟）。
-            response = self.session.post(
-                self.base_url + path,
-                headers=self._conversation_headers(path, requirements),
-                json=payload,
-                timeout=120,
-                stream=True,
-            )
-            ensure_ok(response, path)
-            topic = ""
-            try:
-                for sse in iter_sse_payloads(response):
-                    try:
-                        event = json.loads(sse)
-                    except Exception:
-                        continue
-                    if isinstance(event, dict) and event.get("type") == "stream_handoff":
-                        topic = "conversation-turn-" + str(event.get("turn_exchange_id") or "")
-                        break
-            finally:
-                response.close()
-            if not topic:
-                raise RuntimeError("thinking turn did not hand off to a websocket stream")
-            # 订阅本轮 topic（offset=0 从头开始）。
             ws.send_str(json.dumps([{"id": 2, "command": {"type": "subscribe", "topic_id": topic, "offset": "0"}}]))
             deadline = time.time() + WS_STREAM_TIMEOUT_SECS
             while time.time() < deadline:
