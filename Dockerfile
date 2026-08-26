@@ -30,7 +30,9 @@ WORKDIR /app
 # - git: Git 存储后端需要
 # - libpq-dev: PostgreSQL 客户端库
 # - gcc: 编译 psycopg2-binary 需要
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 通过代理拉取时偶发 503，开启重试并禁用并行/pipelining 提升稳定性。
+RUN echo 'Acquire::Retries "10"; Acquire::http::Pipeline-Depth "0"; Acquire::Queue-Mode "access";' > /etc/apt/apt.conf.d/80-retries \
+    && apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
