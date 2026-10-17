@@ -3,7 +3,6 @@ import json
 import random
 import re
 import time
-from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Sequence
 
@@ -11,6 +10,7 @@ import pybase64
 
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 from utils.helper import new_uuid
+from utils.browser_timezone import DEFAULT_TIMEZONE, browser_time
 
 
 CORES = [8, 16, 24, 32]
@@ -49,15 +49,16 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     return script_sources, data_build
 
 
-def _legacy_parse_time() -> str:
-    now = datetime.now(timezone(timedelta(hours=-5)))
-    return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
+def _legacy_parse_time(timezone_name: str = DEFAULT_TIMEZONE) -> str:
+    return browser_time(timezone_name)
 
 
 def build_pow_config(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    *,
+    timezone_name: str = DEFAULT_TIMEZONE,
 ) -> list[Any]:
     navigator_key = random.choice([
         "registerProtocolHandler−function registerProtocolHandler() { [native code] }",
@@ -143,7 +144,7 @@ def build_pow_config(
     script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
     return [
         sum(random.choices(SCREEN_RESOLUTIONS, k=1)[0]),
-        _legacy_parse_time(),
+        _legacy_parse_time(timezone_name),
         4294705152,
         1,
         user_agent,
@@ -186,8 +187,10 @@ def build_legacy_requirements_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    *,
+    timezone_name: str = DEFAULT_TIMEZONE,
 ) -> str:
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, timezone_name=timezone_name)
     return "gAAAAAC" + pybase64.b64encode(
         json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
     ).decode()
@@ -199,8 +202,10 @@ def build_proof_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    *,
+    timezone_name: str = DEFAULT_TIMEZONE,
 ) -> str:
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, timezone_name=timezone_name)
     answer, solved = _pow_generate(seed, difficulty, config)
     if not solved:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")

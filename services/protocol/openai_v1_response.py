@@ -510,7 +510,7 @@ def response_events(body: dict[str, Any], base_url: str = "") -> Iterator[dict[s
         key = cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_response(text_backend(), body, messages, base_url=base_url),
+            lambda: stream_text_response(text_backend(model), body, messages, base_url=base_url),
         )
         return
 

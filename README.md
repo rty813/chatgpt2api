@@ -27,6 +27,12 @@ docker compose up -d
 
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
+`config.json` 的 `upstream_timezone` 应与访问 ChatGPT 的代理出口所在地一致，使用 IANA 时区名称。
+例如洛杉矶出口设置为 `"upstream_timezone": "America/Los_Angeles"`；也可通过环境变量
+`CHATGPT2API_UPSTREAM_TIMEZONE` 覆盖。时区名称会统一用于对话请求和 Sentinel 校验，UTC 偏移按当前
+夏令时自动计算。账号使用独立代理时，可在账号数据中设置 `timezone` 覆盖全局值。
+未配置时默认 `Asia/Shanghai`；出口跨时区变化后需同步更新配置，直接修改配置文件后需重启服务。
+
 - Web 面板：`http://localhost:3000`
 - API 地址：`http://localhost:3000/v1`
 - 数据目录：`./data`
@@ -109,8 +115,10 @@ environment:
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
-- `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`
+- `GET /v1/models` 返回号池账号在上游可见的全部文本模型（含 `gpt-6-pro` / `gpt-5-6-pro` / `*-thinking` 等，
+  以订阅等级为准）+ `gpt-image-2`、`codex-gpt-image-2` 等本服务自有的图片模型
+- 支持 Pro 专属文本模型（slug 以 `-pro` 结尾，如 `gpt-6-pro`），请求会被强制调度到 `Pro` 账号；
+  号池里没有可用 Pro 账号时直接报错，不会静默降级成别的模型
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
@@ -173,7 +181,7 @@ Authorization: Bearer <auth-key>
 <summary><code>GET /v1/models</code></summary>
 <br>
 
-返回当前暴露的图片模型列表。
+返回当前暴露的模型列表（上游可见的文本模型 + 本服务自有的图片模型）。结果按账号缓存 5 分钟。
 
 ```bash
 curl http://localhost:8000/v1/models \
@@ -186,7 +194,7 @@ curl http://localhost:8000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` |
+| 返回模型 | 号池账号在上游可见的文本模型（`auto`、`gpt-5-5`、`gpt-5-6`、`*-thinking`、`gpt-6-pro` 等，随订阅等级变化）+ `gpt-image-2`、`codex-gpt-image-2` |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>

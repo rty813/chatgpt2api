@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
 import tiktoken
+from fastapi import HTTPException
 
 from services.account_service import account_service
 from services.config import config
@@ -17,9 +18,11 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    PRO_TEXT_MODEL_PLAN_TYPE,
     build_chat_image_markdown_content,
     extract_image_from_message_content,
     is_codex_image_model,
+    is_pro_text_model,
     is_supported_image_model,
     split_image_model,
 )
@@ -1127,8 +1130,31 @@ def conversation_events(
     yield from iter_conversation_payloads(payloads, history_text, history_messages, thinking=bool(thinking_effort) and not image_model)
 
 
-def text_backend() -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+def required_text_plan_type(model: str) -> str | None:
+    """文本模型对账号套餐的硬性要求。
+
+    Pro 专属模型（`*-pro`）只有 Pro 账号能真正跑：上游对**任何** slug 都照单全收并原样回显
+    （实测发伪造的 `gpt-99-pro` 也会正常作答、会话文档里也存成 `gpt-99-pro`），不会报错，
+    所以落到非 Pro 账号只会静默降级成该账号的默认模型。必须在调度侧限定套餐。
+    """
+    return PRO_TEXT_MODEL_PLAN_TYPE if is_pro_text_model(model) else None
+
+
+def no_text_account_error(model: str) -> Exception:
+    if required_text_plan_type(model):
+        return HTTPException(status_code=400, detail={
+            "error": f"model {model} requires a ChatGPT Pro account, but no available Pro account is configured"
+        })
+    return RuntimeError("no available text account")
+
+
+def text_backend(model: str = "") -> OpenAIBackendAPI:
+    """按模型挑一个可用文本账号（Pro 专属模型只挑 Pro 号）。"""
+    plan_type = required_text_plan_type(model)
+    access_token = account_service.get_text_access_token(plan_type=plan_type)
+    if plan_type and not access_token:
+        raise no_text_account_error(model)
+    return OpenAIBackendAPI(access_token=access_token)
 
 
 THINKING_EMPTY_MAX_RETRIES = 2
@@ -1208,7 +1234,7 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
     empty_retries = 0
     while True:
         if not token:
-            raise RuntimeError("no available text account")
+            raise no_text_account_error(request.model)
         attempted_tokens.add(token)
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
@@ -1271,7 +1297,10 @@ def _stream_text_failover(backend: OpenAIBackendAPI, request: ConversationReques
                     token = refreshed_token
                 else:
                     account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(attempted_tokens)
+                    # 换号也要守住套餐要求，否则 Pro 专属模型会悄悄落到 Plus 号上被降级。
+                    token = account_service.get_text_access_token(
+                        attempted_tokens, plan_type=required_text_plan_type(request.model)
+                    )
                 if token:
                     continue
             raise

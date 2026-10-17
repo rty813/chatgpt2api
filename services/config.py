@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 
 from services.storage.base import StorageBackend
+from utils.browser_timezone import validate_timezone
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -594,6 +595,7 @@ class ConfigStore:
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["text_chat_privacy_mode"] = self.text_chat_privacy_mode
+        data["upstream_timezone"] = self.upstream_timezone
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
@@ -608,6 +610,10 @@ class ConfigStore:
 
     def get_proxy_settings(self) -> str:
         return str(self.data.get("proxy") or "").strip()
+
+    @property
+    def upstream_timezone(self) -> str:
+        return validate_timezone(os.getenv("CHATGPT2API_UPSTREAM_TIMEZONE") or self.data.get("upstream_timezone"))
 
     def get_proxy_runtime_settings(self) -> dict[str, object]:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
@@ -630,6 +636,8 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        if "upstream_timezone" in next_data:
+            next_data["upstream_timezone"] = validate_timezone(next_data["upstream_timezone"])
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

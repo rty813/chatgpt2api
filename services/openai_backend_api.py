@@ -25,6 +25,7 @@ from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.browser_timezone import timezone_offset_min, validate_timezone
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -182,6 +183,8 @@ class OpenAIBackendAPI:
         self.access_token = access_token
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
+        # 账号独立代理可单独指定时区；同一客户端的请求体和 Sentinel 使用同一时区。
+        self.timezone = validate_timezone(self.account.get("timezone") or config.upstream_timezone)
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
@@ -222,6 +225,10 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    @property
+    def timezone_offset_min(self) -> int:
+        return timezone_offset_min(self.timezone)
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -289,7 +296,7 @@ class OpenAIBackendAPI:
                 "gizmo_id": None,
                 "requested_default_model": None,
                 "conversation_id": None,
-                "timezone_offset_min": -480,
+                "timezone_offset_min": self.timezone_offset_min,
             },
             timeout=20,
         )
@@ -299,7 +306,7 @@ class OpenAIBackendAPI:
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+        response = self.session.get(self.base_url + path + f"?timezone_offset_min={self.timezone_offset_min}", headers=self._headers(path),
                                     timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -394,6 +401,7 @@ class OpenAIBackendAPI:
                 self.user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                timezone_name=self.timezone,
             )
 
         turnstile_token = ""
@@ -519,7 +527,7 @@ class OpenAIBackendAPI:
             "supported_encodings": [],
             "system_hints": [],
             "timezone": timezone,
-            "timezone_offset_min": -480,
+            "timezone_offset_min": timezone_offset_min(timezone),
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
             "client_contextual_info": {
@@ -840,8 +848,8 @@ class OpenAIBackendAPI:
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": self.timezone_offset_min,
+            "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": ["picture_v2"],
             "partial_query": {
@@ -978,8 +986,8 @@ class OpenAIBackendAPI:
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": self.timezone_offset_min,
+            "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
@@ -1216,7 +1224,7 @@ class OpenAIBackendAPI:
                 "file_name": file_name,
                 "file_size": len(data),
                 "use_case": "multimodal",
-                "timezone_offset_min": -480,
+                "timezone_offset_min": self.timezone_offset_min,
                 "reset_rate_limits": False,
                 "store_in_library": True,
                 "library_persistence_mode": "opportunistic",
@@ -1289,8 +1297,8 @@ class OpenAIBackendAPI:
             "parent_message_id": "client-created-root",
             "model": EDITABLE_FILE_MODEL,
             "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": self.timezone_offset_min,
+            "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": [],
             "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
@@ -1357,8 +1365,8 @@ class OpenAIBackendAPI:
                 "parent_message_id": "client-created-root",
                 "model": EDITABLE_FILE_MODEL,
                 "client_prepare_state": "sent",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
+                "timezone_offset_min": self.timezone_offset_min,
+                "timezone": self.timezone,
                 "conversation_mode": {"kind": "primary_assistant"},
                 "enable_message_followups": True,
                 "system_hints": [],
@@ -1787,8 +1795,8 @@ class OpenAIBackendAPI:
                 "parent_message_id": "client-created-root",
                 "model": model,
                 "client_prepare_state": "success",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
+                "timezone_offset_min": self.timezone_offset_min,
+                "timezone": self.timezone,
                 "conversation_mode": {"kind": "primary_assistant"},
                 "system_hints": ["search"],
                 "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
@@ -1828,8 +1836,8 @@ class OpenAIBackendAPI:
                 "parent_message_id": "client-created-root",
                 "model": model,
                 "client_prepare_state": "success",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
+                "timezone_offset_min": self.timezone_offset_min,
+                "timezone": self.timezone,
                 "conversation_mode": {"kind": "primary_assistant"},
                 "enable_message_followups": True,
                 "system_hints": [],
@@ -2049,7 +2057,7 @@ class OpenAIBackendAPI:
         path = "/backend-api/f/conversation/prepare"
         body = {
             "action": "next", "fork_from_shared_post": False, "parent_message_id": parent_message_id,
-            "model": model, "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai",
+            "model": model, "client_prepare_state": "success", "timezone_offset_min": self.timezone_offset_min, "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"}, "system_hints": [DEEP_RESEARCH_HINT],
             "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
             "supports_buffering": True, "supported_encodings": ["v1"], "client_contextual_info": {"app_name": "chatgpt.com"},
@@ -2092,7 +2100,7 @@ class OpenAIBackendAPI:
                     },
                 }],
                 "parent_message_id": "client-created-root", "model": model, "client_prepare_state": "success",
-                "timezone_offset_min": -480, "timezone": "Asia/Shanghai", "conversation_mode": {"kind": "primary_assistant"},
+                "timezone_offset_min": self.timezone_offset_min, "timezone": self.timezone, "conversation_mode": {"kind": "primary_assistant"},
                 "enable_message_followups": True, "system_hints": [DEEP_RESEARCH_HINT], "supports_buffering": True,
                 "supported_encodings": ["v1"], "paragen_cot_summary_display_override": "allow",
                 "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 40, "page_height": 925,
@@ -2183,14 +2191,14 @@ class OpenAIBackendAPI:
                      "caterpillar_selected_sources": ["web"], "selected_mcp_sources": [], "selected_sources": ["web"],
                      "selected_github_repos": [], "selected_all_github_repos": False,
                      "system_hints": [DEEP_RESEARCH_HINT], "deep_research_version": "standard", "venus_model_variant": "standard",
-                     "serialization_metadata": {"custom_symbol_offsets": []}, "user_timezone": "Asia/Shanghai",
+                     "serialization_metadata": {"custom_symbol_offsets": []}, "user_timezone": self.timezone,
                      "targeted_reply": plan_title, "targeted_reply_label": plan_title}},
                 {"id": new_uuid(), "author": {"role": "system"},
                  "content": {"content_type": "text", "parts": [f"The user is referring to this in particular:\n{plan_title}"]},
                  "metadata": {"exclude_after_next_user_message": True, "is_visually_hidden_from_conversation": True}},
             ],
             "conversation_id": conversation_id, "parent_message_id": parent, "model": model,
-            "client_prepare_state": "success", "timezone_offset_min": -480, "timezone": "Asia/Shanghai",
+            "client_prepare_state": "success", "timezone_offset_min": self.timezone_offset_min, "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"}, "enable_message_followups": True,
             "system_hints": [DEEP_RESEARCH_HINT], "supports_buffering": True, "supported_encodings": ["v1"],
             "paragen_cot_summary_display_override": "allow", "force_parallel_switch": "auto", "thinking_effort": "extended",
@@ -3475,7 +3483,9 @@ class OpenAIBackendAPI:
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
-        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+        p_token = build_legacy_requirements_token(
+            self.user_agent, self.pow_script_sources, self.pow_data_build, timezone_name=self.timezone
+        )
 
         prepare_path = base + "/prepare"
         response = self.session.post(
@@ -3499,6 +3509,7 @@ class OpenAIBackendAPI:
                 self.user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                timezone_name=self.timezone,
             )
 
         turnstile_token = ""
@@ -3535,8 +3546,8 @@ class OpenAIBackendAPI:
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:
-            return "/backend-api/conversation", "Asia/Shanghai"
-        return "/backend-anon/conversation", "America/Los_Angeles"
+            return "/backend-api/conversation", self.timezone
+        return "/backend-anon/conversation", self.timezone
 
     def list_models(self) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""

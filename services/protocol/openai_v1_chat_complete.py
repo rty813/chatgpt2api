@@ -348,7 +348,7 @@ def handle(body: dict[str, Any], base_url: str = "") -> dict[str, Any] | Iterato
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort, emit_reasoning=True, base_url=base_url),
+            lambda: stream_text_chat_completion(text_backend(model), messages, model, thinking_effort, emit_reasoning=True, base_url=base_url),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
@@ -359,7 +359,7 @@ def handle(body: dict[str, Any], base_url: str = "") -> dict[str, Any] | Iterato
 
     def build_text_response() -> dict[str, Any]:
         content, reasoning, seconds = collect_text_and_reasoning(
-            text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort, base_url=base_url)
+            text_backend(model), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort, base_url=base_url)
         )
         return completion_response(
             model,

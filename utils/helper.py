@@ -126,6 +126,16 @@ def is_supported_image_model(model: object) -> bool:
     return base_model is not None
 
 
+# Pro 专属文本模型：上游 slug 以 `-pro` 结尾（gpt-6-pro / gpt-5-6-pro / gpt-5-5-pro / o3-pro …）。
+# 用后缀而非白名单，是为了自动覆盖上游后续新增的 Pro 模型。图片模型用的是 `pro-` 前缀
+# （见 split_image_model），两者不会混淆。
+PRO_TEXT_MODEL_PLAN_TYPE = "pro"
+
+
+def is_pro_text_model(model: object) -> bool:
+    return str(model or "").strip().lower().endswith("-pro")
+
+
 def is_codex_image_model(model: object) -> bool:
     _, base_model = split_image_model(model)
     return base_model == CODEX_IMAGE_MODEL
@@ -177,11 +187,18 @@ class UpstreamHTTPError(RuntimeError):
 def ensure_ok(response: requests.Response, context: str) -> None:
     if 200 <= response.status_code < 300:
         return
-    body: Any = response.text
     try:
-        body = response.json()
-    except Exception:
-        pass
+        body: Any = response.text
+        # curl_cffi 的流式响应在消费前 content/text 为空，错误正文仍在队列中。
+        if not body and getattr(response, "queue", None) is not None:
+            raw_body = b"".join(response.iter_content())
+            body = raw_body.decode(response.encoding or "utf-8", errors="replace")
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError):
+            pass
+    finally:
+        response.close()
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
     retry_after: int | None = None
     if retry_after_header is not None:
