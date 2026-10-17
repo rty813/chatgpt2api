@@ -269,3 +269,16 @@ SSE 结束后可按以下顺序判断结果：
 4. 查询完整会话时，仍然只读取 `role=tool` 且 `async_task_type=image_gen` 的消息。
 5. 如果没有图片结果也没有文本，返回上游异常或空结果错误。
 
+## GenUI 交互选择卡片
+
+助手的正文文本可能包含 `{@body const [topic,setTopic] = DIL.useState("relationship")}`、`<box>`、`<radio-group>`、`<radio>`，以及带 `GenUI.issueNewTurn(...)` 的 `<button>`。这类内容仍属于正文，沿用 `text` / `multimodal_text` 消息的现有传输方式；不新增工具调用、交互事件或 API 字段。
+
+chatgpt2api 保留声明、标签、花括号、箭头函数、引号、缩进和中文文本，快照及补丁仍转换为新增后缀。OpenAI Chat Completions 的流式 `delta.content` 与非流式 `message.content` 均保留源文本；它不应混入 `reasoning_content`。中间的 Dify 工作流也需要将正文原样交给前端，避免 HTML 转义或清理标签。
+
+配套 `orca-ai-web` 使用现有布局解析器识别这些数据：支持字符串初始状态、单选组，以及续问的字符串字面量或 `({选项值:"续问文本"})[状态变量]` 映射。前端不会执行模型返回的 JavaScript。只有用户点击按钮才通过原有会话发送接口提交对应的纯文本问题，无需请求 ChatGPT 网页端的专用交互接口。
+
+`test/fixtures/chatgpt_genui_npd.txt` 保留完整 NPD 选择卡片示例，与配套前端的 fixture 一致。执行下面的离线回归测试可验证普通/思考模式、逐字快照、逐字补丁、重放、流结束以及流式/非流式 Chat Completions 的源文本完整性：
+
+```bash
+.venv/bin/python -m unittest test.test_genui_passthrough test.test_stream_text_integrity test.test_thinking_channel_classification
+```

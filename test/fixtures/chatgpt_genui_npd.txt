@@ -1,0 +1,11 @@
+{@body const [topic,setTopic] = DIL.useState("relationship")}
+<box border radius="xl" padding={3} gap={3}>
+  <radio-group value={topic} onChange={setTopic} direction="col">
+    <radio value="relationship">心理学中的 NPD，以及它在亲密关系中的表现</radio>
+    <radio value="identify">如何判断一个人是否具有 NPD 特征</radio>
+    <radio value="self">如何判断自己是否有自恋倾向</radio>
+    <radio value="treatment">NPD 能否治疗，以及如何与这类人相处</radio>
+    <radio value="other">其他含义，例如商业领域的 NPD</radio>
+  </radio-group>
+  <button block onClick={() => GenUI.issueNewTurn(({relationship:"请详细解释 NPD 在亲密关系中的表现。",identify:"请解释如何识别 NPD 特征，以及有哪些判断局限。",self:"请解释如何区分正常自恋、自恋倾向和 NPD。",treatment:"请介绍 NPD 的治疗方式，以及与具有明显自恋特质的人相处的方法。",other:"请解释 NPD 的其他含义。"} )[topic])}>继续了解</button>
+</box>
