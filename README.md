@@ -54,6 +54,10 @@ docker compose -f docker-compose.warp.yml up -d --build
 
 ### 本地开发
 
+文本流按消息 ID 跟踪累计快照，仅向 OpenAI 兼容接口发送新增后缀。重复或较短的过期快照不会重发正文；如果上游改写已发送的前文，流会报错，避免把整份回复再次追加到下游。正文清理仅处理 ChatGPT 私有引用标记，保留代码换行、缩进及 `:=` 等运算符前的空格。流末暂存的空白会在结束时补齐。
+
+相关离线回归可运行 `uv run python -m unittest test.test_stream_text_integrity test.test_thinking_channel_classification test.test_chat_completion_cache test.test_thinking_stream`。
+
 启动后端：
 
 ```bash

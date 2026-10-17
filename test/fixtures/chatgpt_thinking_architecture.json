@@ -1,0 +1,123 @@
+{
+  "description": "2026-10-17 真实上游思考流：仅保留 assistant reasoning_recap/final、message_marker 和 DONE，消息 ID 已匿名化。",
+  "events": [
+    {
+      "type": "message_marker",
+      "marker": "cot_token",
+      "message_id": "message-1",
+      "event": "first"
+    },
+    {
+      "message": {
+        "id": "message-1",
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "content_type": "reasoning_recap",
+          "content": "思考了两秒"
+        },
+        "channel": null,
+        "recipient": "all",
+        "end_turn": false,
+        "metadata": {
+          "reasoning_status": "reasoning_ended",
+          "finished_duration_sec": 1
+        }
+      }
+    },
+    {
+      "type": "message_marker",
+      "marker": "user_visible_token",
+      "message_id": "message-2",
+      "event": "first"
+    },
+    {
+      "type": "message_marker",
+      "marker": "final_channel_token",
+      "message_id": "message-2",
+      "event": "first"
+    },
+    {
+      "message": {
+        "id": "message-2",
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "<escape><box border radius=\"lg\" padding={3}><title>调试架构图</title><row><text>接收任务"
+          ]
+        },
+        "channel": "final",
+        "recipient": "all",
+        "end_turn": null,
+        "metadata": {}
+      }
+    },
+    {
+      "message": {
+        "id": "message-2",
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "<escape><box border radius=\"lg\" padding={3}><title>调试架构图</title><row><text>接收任务</text><icon name=\"arrow-down\"/><text>交付结果</text></row></box></escape>"
+          ]
+        },
+        "channel": "final",
+        "recipient": "all",
+        "end_turn": null,
+        "metadata": {}
+      }
+    },
+    {
+      "message": {
+        "id": "message-2",
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "<escape><box border radius=\"lg\" padding={3}><title>调试架构图</title><row><text>接收任务</text><icon name=\"arrow-down\"/><text>交付结果</text></row></box></escape>"
+          ]
+        },
+        "channel": "final",
+        "recipient": "all",
+        "end_turn": true,
+        "metadata": {}
+      }
+    },
+    {
+      "type": "message_marker",
+      "marker": "last_token",
+      "message_id": "message-2",
+      "event": "last"
+    },
+    {
+      "message": {
+        "id": "message-2",
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "<escape><box border radius=\"lg\" padding={3}><title>调试架构图</title><row><text>接收任务</text><icon name=\"arrow-down\"/><text>交付结果</text></row></box></escape>"
+          ]
+        },
+        "channel": "final",
+        "recipient": "all",
+        "end_turn": true,
+        "metadata": {}
+      }
+    },
+    "[DONE]"
+  ],
+  "expected_content": "<escape><box border radius=\"lg\" padding={3}><title>调试架构图</title><row><text>接收任务</text><icon name=\"arrow-down\"/><text>交付结果</text></row></box></escape>",
+  "expected_reasoning": "思考了两秒"
+}

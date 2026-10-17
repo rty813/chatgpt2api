@@ -366,7 +366,7 @@ class ConversationState:
     # 代码解释器：从流里捕获引用 sandbox:/mnt/data 文件的消息 id，供下载接口使用（隐私模式下
     # 会话文档不可轮询，必须靠这些流内 id 走定向下载）。
     sandbox_message_ids: list[str] = field(default_factory=list)
-    # 思考 turn 的按消息分通道跟踪（仅 thinking=True 时使用）
+    # 按消息 ID 跟踪累计快照，防止切换消息或重连重放时重复输出。
     msg_order: list[str] = field(default_factory=list)
     msg_text: dict[str, str] = field(default_factory=dict)
     msg_kind: dict[str, str] = field(default_factory=dict)
@@ -441,7 +441,7 @@ def strip_history(text: str, history_text: str = "") -> str:
     return text
 
 
-def sanitize_output_text(text: str) -> str:
+def sanitize_output_text(text: str, *, final: bool = True) -> str:
     text = str(text or "")
 
     def is_internal_annotation_part(part: str) -> bool:
@@ -480,10 +480,19 @@ def sanitize_output_text(text: str) -> str:
     # ChatGPT web sometimes returns rich annotation markers using private-use
     # characters. API clients cannot render those. Preserve readable labels
     # from entity/link annotations, while removing internal citation pointers.
-    text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
+    def replace_with_spacing(match: re.Match[str]) -> str:
+        prefix = match.group(0).split("\ue200", 1)[0]
+        readable = replace_annotation(match)
+        following = match.string[match.end():match.end() + 1]
+        # 只清理被移除引用与标点之间的水平空白，保留代码中的换行、缩进和运算符空格。
+        if not readable and following and following in ".,;:!?":
+            return ""
+        return prefix + readable
+
+    text = re.sub(r"[ \t]*\ue200([^\ue201]*)\ue201", replace_with_spacing, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
-    return text
+    # 引用可能在下一帧才到达，暂存结尾水平空白，避免清理引用后回头修改已发内容。
+    return text if final else text.rstrip(" \t")
 
 
 def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
@@ -722,12 +731,13 @@ def _patch_reasoning_value(operation: dict[str, Any]) -> str:
 
 
 def apply_reasoning_patch(event: dict[str, Any], current_text: str = "") -> str:
-    """应用 thoughts/code reasoning 的增量补丁。"""
+    """应用 thoughts/code 及显式思考文本消息的增量补丁。"""
     path = str(event.get("p") or "")
     op = event.get("o")
     if op in ("append", "replace") and (
         path.startswith("/message/content/thoughts")
         or path.startswith("/message/content/text")
+        or path == "/message/content/parts/0"
         or path == "/message/content"
     ):
         value = _patch_reasoning_value(event)
@@ -900,15 +910,23 @@ def _event_message(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _classify_message(message: dict[str, Any]) -> str:
-    """思考 turn 的消息分类：thinking（思考/工具调用）| text（正文或预告白）| skip。"""
+    """按明确通道和类型分类；未标记的普通文本留待正文标记确认。"""
     role = str((message.get("author") or {}).get("role") or "").strip().lower()
     metadata = message.get("metadata") or {}
-    reasoning_status = str(metadata.get("reasoning_status") or "") if isinstance(metadata, dict) else ""
+    if not isinstance(metadata, dict):
+        metadata = {}
+    reasoning_status = str(metadata.get("reasoning_status") or "")
+    channel = str(message.get("channel") or metadata.get("channel") or "").strip().lower()
     if role == "tool" and reasoning_status == "is_reasoning":
         return "thinking"
     if role != "assistant":
         return "skip"
     content_type = (message.get("content") or {}).get("content_type")
+    # 思考通道、思考状态和发往工具的消息都不能被 last_token 当成正文。
+    recipient = str(message.get("recipient") or "").strip().lower()
+    if (reasoning_status == "is_reasoning" or channel in ("analysis", "commentary")
+            or recipient not in ("", "all")):
+        return "thinking"
     if content_type in ("thoughts", "reasoning_recap", "code"):
         return "thinking"
     if content_type in ("text", "multimodal_text"):
@@ -937,8 +955,8 @@ def _marker_event(event: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _advance_thinking_state(state: ConversationState, event: dict[str, Any], history_text: str) -> None:
-    """更新思考 turn 的按消息跟踪状态。"""
+def _advance_message_state(state: ConversationState, event: dict[str, Any], history_text: str) -> None:
+    """更新按消息跟踪状态，忽略重连时重放的较短快照。"""
     marker = _marker_event(event)
     if marker is not None:
         if str(marker.get("marker") or "") in ("final_channel_token", "last_token"):
@@ -959,7 +977,16 @@ def _advance_thinking_state(state: ConversationState, event: dict[str, Any], his
         if mid not in state.msg_text:
             state.msg_order.append(mid)
         state.msg_kind[mid] = kind
-        state.msg_text[mid] = _message_text_for_kind(message)
+        next_text = _message_text_for_kind(message)
+        if kind == "text":
+            next_text = strip_history(next_text, history_text)
+        current = state.msg_text.get(mid, "")
+        if mid not in state.msg_text or not current.startswith(next_text):
+            state.msg_text[mid] = next_text
+        metadata = message.get("metadata") or {}
+        channel = message.get("channel") or (metadata.get("channel") if isinstance(metadata, dict) else "")
+        if kind == "text" and str(channel or "").strip().lower() == "final":
+            state.final_ids.add(mid)
         state.cur_id = mid
         return
     # 没有 message 的补丁（正文或思考的 v/p 增量），追加到当前消息。
@@ -978,11 +1005,11 @@ def _advance_thinking_state(state: ConversationState, event: dict[str, Any], his
         state.msg_text[cur] = apply_reasoning_patch(event, current)
 
 
-def _rebuild_thinking(state: ConversationState) -> tuple[str, str]:
+def _rebuild_message_text(state: ConversationState, *, thinking: bool) -> tuple[str, str]:
     """根据按消息跟踪重建 (answer_raw, reasoning)。
 
-    正文 = 被 final_channel_token/last_token 标记的消息（预告白永远不带该标记 → 始终归思考）；
-    其余 assistant 文本/思考/工具调用 → 思考。这样与到达顺序无关，不会把预告白误当正文。
+    思考模式下，明确的思考/工具消息归入思考；普通文本仅在 final 通道或正文标记确认后输出。
+    未确认的文本暂存，避免先作为 reasoning_delta 发出、标记迟到后又作为正文补发。
     """
     reasoning_parts: list[str] = []
     reasoning_seen: set[str] = set()
@@ -992,14 +1019,26 @@ def _rebuild_thinking(state: ConversationState) -> tuple[str, str]:
         text = state.msg_text.get(mid, "")
         if not text:
             continue
-        if kind == "text" and mid in state.final_ids:
-            answer += text
-        else:
+        if kind == "text":
+            if not thinking or mid in state.final_ids:
+                answer += text
+            # 普通文本可能稍后才收到 final_channel_token，确认前不抢先输出为思考。
+        elif thinking and kind == "thinking":
             cleaned = text.strip()
             if cleaned and cleaned not in reasoning_seen:
                 reasoning_seen.add(cleaned)
                 reasoning_parts.append(cleaned)
     return answer, "\n\n".join(part for part in reasoning_parts if part)
+
+
+def _snapshot_delta(previous: str, current: str) -> str:
+    """只将累计快照的新增后缀转换为增量；过期快照不重复发出。"""
+    if current.startswith(previous):
+        return current[len(previous):]
+    if previous.startswith(current):
+        return ""
+    # OpenAI 增量协议不能撤回已发文本；明确报错，避免把全文当增量污染下游存储。
+    raise RuntimeError("upstream text changed an emitted prefix; cannot represent it as append-only deltas")
 
 
 def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
@@ -1013,16 +1052,6 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         if not payload:
             continue
         if payload == "[DONE]":
-            # 兜底：思考 turn 若结束时仍未识别出正文（理论上正文都带 final/last 标记，
-            # 实测总有；此处仅防御），把最后一条文本消息当正文补发。
-            if thinking and not state.text:
-                fallback = next((state.msg_text[mid] for mid in reversed(state.msg_order)
-                                 if state.msg_kind.get(mid) == "text" and state.msg_text.get(mid)), "")
-                fallback = sanitize_output_text(fallback)
-                if fallback:
-                    state.text = fallback
-                    yield conversation_base_event("conversation.delta", state, delta=fallback, reasoning_delta="")
-            yield conversation_base_event("conversation.done", state, done=True)
             break
         try:
             event = json.loads(payload)
@@ -1034,37 +1063,38 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             yield conversation_base_event("conversation.event", state, raw=event)
             continue
         update_conversation_state(state, payload, event)
-        if thinking:
-            _advance_thinking_state(state, event, history_text)
-            answer_raw, next_reasoning = _rebuild_thinking(state)
-            next_text = sanitize_output_text(answer_raw)
-            text_changed = next_text != state.text
-            reasoning_changed = next_reasoning != state.reasoning
-            if text_changed or reasoning_changed:
-                delta = (next_text[len(state.text):] if next_text.startswith(state.text) else next_text) if text_changed else ""
-                reasoning_delta = (next_reasoning[len(state.reasoning):] if next_reasoning.startswith(state.reasoning) else next_reasoning) if reasoning_changed else ""
-                state.text = next_text
-                state.reasoning = next_reasoning
-                yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta=reasoning_delta)
-                continue
-            yield conversation_base_event("conversation.event", state, raw=event)
-            continue
-        if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
+        if not thinking and history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
             history_index += 1
             state.raw_text = ""
             state.text = ""
             continue
-        # 非思考模型（如 gpt-5-5）不输出 reasoning：即使本轮带 thoughts 消息（常是"延长思考时间"等占位/推广文案），
-        # 也不当作 reasoning 提取，避免给普通对话塞进无意义的思考块。reasoning 仅思考分支产出。
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
-        next_text = sanitize_output_text(next_raw_text)
-        state.raw_text = next_raw_text
-        if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
-            state.text = next_text
-            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta="")
+        message = _event_message(event)
+        next_reasoning = state.reasoning
+        if thinking or state.msg_order or (message and message.get("id")):
+            _advance_message_state(state, event, history_text)
+            state.raw_text, next_reasoning = _rebuild_message_text(state, thinking=thinking)
+        else:
+            # 兼容没有消息 ID 的旧式文本补丁流。
+            state.raw_text = assistant_raw_text(event, state.raw_text, history_text)
+        next_text = sanitize_output_text(state.raw_text, final=False)
+        delta = _snapshot_delta(state.text, next_text)
+        reasoning_delta = _snapshot_delta(state.reasoning, next_reasoning)
+        if delta or reasoning_delta:
+            state.text += delta
+            state.reasoning += reasoning_delta
+            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta, reasoning_delta=reasoning_delta)
             continue
         yield conversation_base_event("conversation.event", state, raw=event)
+
+    # DONE 或自然 EOF 时提交暂存空白；缺失正文标记的思考流仍只兜底最后一条文本。
+    if thinking and not state.text and not state.raw_text:
+        state.raw_text = next((state.msg_text[mid] for mid in reversed(state.msg_order)
+                               if state.msg_kind.get(mid) == "text" and state.msg_text.get(mid)), "")
+    delta = _snapshot_delta(state.text, sanitize_output_text(state.raw_text))
+    if delta:
+        state.text += delta
+        yield conversation_base_event("conversation.delta", state, delta=delta, reasoning_delta="")
+    yield conversation_base_event("conversation.done", state, done=True)
 
 
 def conversation_events(
