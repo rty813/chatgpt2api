@@ -46,7 +46,7 @@ class ThinkingChannelClassificationTests(unittest.TestCase):
     def test_delayed_marker_does_not_emit_answer_as_reasoning(self):
         output = self.assert_stream([message("a", "最终结论"), marker("a")], "最终结论")
         self.assertEqual(len(output), 1)
-        self.assertEqual(output[0]["raw"], marker("a"))
+        self.assertNotIn("raw", output[0])
 
     def test_missing_marker_falls_back_at_done_without_reasoning_copy(self):
         output = self.assert_stream([message("a", "最终结论")], "最终结论")
@@ -73,14 +73,20 @@ class ThinkingChannelClassificationTests(unittest.TestCase):
     def test_marker_before_message_remains_supported(self):
         self.assert_stream([marker("a"), message("a", "最终结论")], "最终结论")
 
-    def test_final_channel_streams_without_waiting_for_marker(self):
+    def test_final_channel_keeps_the_latest_snapshot_until_done(self):
         for fields in ({"channel": "final"}, {"metadata": {"channel": "final"}}):
             with self.subTest(fields=fields):
-                output = self.assert_stream([
+                events = [
                     message("a", "最终", **fields),
                     {"p": "/message/content/parts/0", "o": "append", "v": "结论"},
-                ], "最终结论")
-                self.assertEqual(output[0]["delta"], "最终")
+                ]
+                payloads = [json.dumps(event, ensure_ascii=False) for event in events]
+                stream = iter_conversation_payloads(iter(payloads + ["[DONE]"]), thinking=True)
+                interim = list(stream)
+                self.assertFalse(any(event["type"] == "conversation.delta" for event in interim[:-2]))
+                deltas = [event for event in interim if event["type"] == "conversation.delta"]
+                self.assertEqual([event["delta"] for event in deltas], ["最终结论"])
+                self.assertEqual(interim[-1]["text"], "最终结论")
 
     def test_real_thoughts_remain_separate_from_answer(self):
         self.assert_stream([

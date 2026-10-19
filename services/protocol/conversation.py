@@ -16,6 +16,7 @@ from services.config import config
 from services.file_storage_service import file_storage_service
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.protocol.genui_resources import collect_genui_resources, genui_resource_block
 from utils.helper import (
     IMAGE_MODELS,
     PRO_TEXT_MODEL_PLAN_TYPE,
@@ -373,6 +374,9 @@ class ConversationState:
     msg_order: list[str] = field(default_factory=list)
     msg_text: dict[str, str] = field(default_factory=dict)
     msg_kind: dict[str, str] = field(default_factory=dict)
+    # 上游同时发送片段和合并消息，按明确的关联 ID 只保留一份正文。
+    merged_into: dict[str, str] = field(default_factory=dict)
+    finished_ids: set[str] = field(default_factory=set)
     final_ids: set[str] = field(default_factory=set)
     cur_id: str = ""
 
@@ -980,6 +984,8 @@ def _advance_message_state(state: ConversationState, event: dict[str, Any], hist
         if mid not in state.msg_text:
             state.msg_order.append(mid)
         state.msg_kind[mid] = kind
+        if message.get("status") == "finished_successfully":
+            state.finished_ids.add(mid)
         next_text = _message_text_for_kind(message)
         if kind == "text":
             next_text = strip_history(next_text, history_text)
@@ -987,6 +993,15 @@ def _advance_message_state(state: ConversationState, event: dict[str, Any], hist
         if mid not in state.msg_text or not current.startswith(next_text):
             state.msg_text[mid] = next_text
         metadata = message.get("metadata") or {}
+        if isinstance(metadata, dict):
+            merged_id = metadata.get("merged_message_id")
+            if metadata.get("is_message_fragment") is True and isinstance(merged_id, str) and merged_id != mid:
+                state.merged_into[mid] = merged_id
+            sources = metadata.get("source_message_ids")
+            if metadata.get("is_merged_message") is True and isinstance(sources, list):
+                for source_id in sources:
+                    if isinstance(source_id, str) and source_id and source_id != mid:
+                        state.merged_into[source_id] = mid
         channel = message.get("channel") or (metadata.get("channel") if isinstance(metadata, dict) else "")
         if kind == "text" and str(channel or "").strip().lower() == "final":
             state.final_ids.add(mid)
@@ -1008,15 +1023,18 @@ def _advance_message_state(state: ConversationState, event: dict[str, Any], hist
         state.msg_text[cur] = apply_reasoning_patch(event, current)
 
 
-def _rebuild_message_text(state: ConversationState, *, thinking: bool) -> tuple[str, str]:
+def _rebuild_message_text(state: ConversationState, *, thinking: bool, stable_only: bool = False) -> tuple[str, str]:
     """根据按消息跟踪重建 (answer_raw, reasoning)。
 
     思考模式下，明确的思考/工具消息归入思考；普通文本仅在 final 通道或正文标记确认后输出。
     未确认的文本暂存，避免先作为 reasoning_delta 发出、标记迟到后又作为正文补发。
+    实时阶段仅提交合并正文或明确完成的独立消息；可改写的隐藏片段不提前发出。
     """
     reasoning_parts: list[str] = []
     reasoning_seen: set[str] = set()
+    answer_seen: set[str] = set()
     answer = ""
+    merged_ids = set(state.merged_into.values())
     for mid in state.msg_order:
         kind = state.msg_kind.get(mid)
         text = state.msg_text.get(mid, "")
@@ -1024,7 +1042,16 @@ def _rebuild_message_text(state: ConversationState, *, thinking: bool) -> tuple[
             continue
         if kind == "text":
             if not thinking or mid in state.final_ids:
-                answer += text
+                merged_id = state.merged_into.get(mid, "")
+                if (state.msg_kind.get(merged_id) == "text" and state.msg_text.get(merged_id)
+                        and (not thinking or merged_id in state.final_ids)):
+                    mid = merged_id
+                    text = state.msg_text[mid]
+                if stable_only and mid not in merged_ids and mid not in state.finished_ids:
+                    continue
+                if mid not in answer_seen:
+                    answer_seen.add(mid)
+                    answer += text
             # 普通文本可能稍后才收到 final_channel_token，确认前不抢先输出为思考。
         elif thinking and kind == "thinking":
             cleaned = text.strip()
@@ -1050,6 +1077,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
+    resources: dict[str, dict] = {"images": {}, "citations": {}}
     for payload in payloads:
         # print(f"[upstream_sse] {payload}", flush=True)
         if not payload:
@@ -1072,10 +1100,12 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
             state.text = ""
             continue
         message = _event_message(event)
+        if message:
+            collect_genui_resources(message, resources)
         next_reasoning = state.reasoning
         if thinking or state.msg_order or (message and message.get("id")):
             _advance_message_state(state, event, history_text)
-            state.raw_text, next_reasoning = _rebuild_message_text(state, thinking=thinking)
+            state.raw_text, next_reasoning = _rebuild_message_text(state, thinking=thinking, stable_only=thinking)
         else:
             # 兼容没有消息 ID 的旧式文本补丁流。
             state.raw_text = assistant_raw_text(event, state.raw_text, history_text)
@@ -1090,13 +1120,23 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
         yield conversation_base_event("conversation.event", state, raw=event)
 
     # DONE 或自然 EOF 时提交暂存空白；缺失正文标记的思考流仍只兜底最后一条文本。
-    if thinking and not state.text and not state.raw_text:
-        state.raw_text = next((state.msg_text[mid] for mid in reversed(state.msg_order)
-                               if state.msg_kind.get(mid) == "text" and state.msg_text.get(mid)), "")
-    delta = _snapshot_delta(state.text, sanitize_output_text(state.raw_text))
+    if thinking:
+        state.raw_text, _ = _rebuild_message_text(state, thinking=True)
+    if thinking and not state.raw_text:
+        fallback_id = next((mid for mid in reversed(state.msg_order)
+                            if state.msg_kind.get(mid) == "text" and state.msg_text.get(mid)), "")
+        state.raw_text = (state.msg_text.get(state.merged_into.get(fallback_id, ""))
+                          or state.msg_text.get(fallback_id, ""))
+    final_text = sanitize_output_text(state.raw_text)
+    delta = _snapshot_delta(state.text, final_text)
     if delta:
         state.text += delta
         yield conversation_base_event("conversation.delta", state, delta=delta, reasoning_delta="")
+    if re.search(r"<(?:AsyncImage|Cite)\b", final_text):
+        block = genui_resource_block(resources)
+        if block:
+            state.text += block
+            yield conversation_base_event("conversation.delta", state, delta=block, reasoning_delta="")
     yield conversation_base_event("conversation.done", state, done=True)
 
 

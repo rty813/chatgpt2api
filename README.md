@@ -60,9 +60,9 @@ docker compose -f docker-compose.warp.yml up -d --build
 
 ### 本地开发
 
-文本流按消息 ID 跟踪累计快照，仅向 OpenAI 兼容接口发送新增后缀。重复或较短的过期快照不会重发正文；如果上游改写已发送的前文，流会报错，避免把整份回复再次追加到下游。正文清理仅处理 ChatGPT 私有引用标记，保留代码换行、缩进及 `:=` 等运算符前的空格。流末暂存的空白会在结束时补齐。
+文本流按消息 ID 跟踪累计快照。重复或较短的过期快照不会重发正文；上游同时发送正文片段和合并消息时，按 `merged_message_id` / `source_message_ids` 关联，只输出一份合并正文。思考模型实时发送思考与明确的合并正文增量，仅暂存可改写的临时片段；独立正文在消息完成或流结束时提交，不再缓存整轮过程。普通模型仍逐段流式发送，若发生不可表示的前缀改写会报错。正文清理仅处理 ChatGPT 私有引用标记，保留代码换行、缩进及 `:=` 等运算符前的空格。流末暂存的空白会在结束时补齐。GenUI 图片和引用从 `model_dil_v2` 资源元数据提取，以末尾的 `<genui-resources data={...}/>` 声明携带真实地址；配套网页收集并渲染这些数据，不执行上游代码。
 
-相关离线回归可运行 `uv run python -m unittest test.test_stream_text_integrity test.test_thinking_channel_classification test.test_chat_completion_cache test.test_thinking_stream`。
+相关离线回归可运行 `uv run python -m unittest test.test_stream_text_integrity test.test_thinking_channel_classification test.test_chat_completion_cache test.test_thinking_stream test.test_genui_resources`。
 
 启动后端：
 
