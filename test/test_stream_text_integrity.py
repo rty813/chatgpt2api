@@ -187,6 +187,41 @@ class StreamTextIntegrityTests(unittest.TestCase):
         self.assertEqual(len(consumed), 4)
         self.assertEqual(list(output)[-1]["text"], "正确正文，继续生成。")
 
+    def test_finished_draft_rewritten_by_later_merged_message_does_not_break_stream(self):
+        # 实际事故：思考中途先完成了一版草稿正文，随后搜索，最终合并消息认领草稿并改写全文。
+        # 旧逻辑已把草稿作为增量发出，合并消息无法表示为追加 → RuntimeError → 下游重试拼出两遍回答。
+        def finished(mid: str, text: str) -> dict:
+            event = message(mid, text)
+            event["message"]["status"] = "finished_successfully"
+            return event
+        merged = message("merged", "可以，而且 **Git 原生就支持按仓库保存**。")
+        merged["message"]["metadata"] = {"is_merged_message": True, "source_message_ids": ["a", "b"]}
+        events = [
+            finished("a", "可以，而且 Git 原生就支持。**"),
+            message("search", "正在搜索", channel="analysis"),
+            finished("b", "你可以让某一个仓库单独保存。**\n\n## 方案一"),
+            message("search2", "再次搜索", channel="analysis"),
+            merged,
+            message("merged", "可以，而且 **Git 原生就支持按仓库保存**。\n\n## 5. 验证"),
+            "[DONE]",
+        ]
+        output = self.assert_content(events, "可以，而且 **Git 原生就支持按仓库保存**。\n\n## 5. 验证", thinking=True)
+        bodies = [event["delta"] for event in output if event.get("delta")]
+        self.assertEqual(bodies[0], "可以，而且 **Git 原生就支持按仓库保存**。")  # 草稿从未发出。
+
+    def test_standalone_messages_are_released_in_order_at_done(self):
+        def finished(mid: str, text: str) -> dict:
+            event = message(mid, text)
+            event["message"]["status"] = "finished_successfully"
+            return event
+        merged = message("merged", "正文")
+        merged["message"]["metadata"] = {"is_merged_message": True, "source_message_ids": ["x"]}
+        # 未被认领的独立消息在前：其后的合并消息也要等到 DONE，顺序不变且不报错。
+        output = self.assert_content([finished("a", "引言\n\n"), merged, "[DONE]"], "引言\n\n正文", thinking=True)
+        self.assertEqual([event["delta"] for event in output if event.get("delta")], ["引言\n\n正文"])
+        # 单条独立回答：行为与之前一致，在 DONE 时整体发出。
+        self.assert_content([finished("a", "完整回答"), "[DONE]"], "完整回答", thinking=True)
+
     def test_openai_chunks_preserve_exact_code(self):
         expected = "# 启动\n./agent\n\nmessages := BuildInitial()\n"
         events = [message("a", expected[:i]) for i in range(1, len(expected) + 1)] + ["[DONE]"]

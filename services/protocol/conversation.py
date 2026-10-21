@@ -1035,19 +1035,26 @@ def _rebuild_message_text(state: ConversationState, *, thinking: bool, stable_on
     answer_seen: set[str] = set()
     answer = ""
     merged_ids = set(state.merged_into.values())
+    # 实时阶段只发合并正文。独立消息即使已完成，也可能稍后被合并消息认领并改写，
+    # 而增量协议无法撤回已发文本（会触发 append-only 报错，下游重试后拼出两遍回答）；
+    # 因此遇到第一条独立消息就暂停正文，DONE 时再整体补齐，保证实时输出始终是最终正文的前缀。
+    held = False
     for mid in state.msg_order:
         kind = state.msg_kind.get(mid)
         text = state.msg_text.get(mid, "")
         if not text:
             continue
         if kind == "text":
+            if held:
+                continue
             if not thinking or mid in state.final_ids:
                 merged_id = state.merged_into.get(mid, "")
                 if (state.msg_kind.get(merged_id) == "text" and state.msg_text.get(merged_id)
                         and (not thinking or merged_id in state.final_ids)):
                     mid = merged_id
                     text = state.msg_text[mid]
-                if stable_only and mid not in merged_ids and mid not in state.finished_ids:
+                if stable_only and mid not in merged_ids:
+                    held = True
                     continue
                 if mid not in answer_seen:
                     answer_seen.add(mid)
