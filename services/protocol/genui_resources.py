@@ -29,25 +29,44 @@ def collect_genui_resources(message: dict[str, Any], resources: dict[str, dict])
     results = (app.get("opGenui") or {}).get("componentResults") or {}
     if not isinstance(constants, dict) or not isinstance(results, dict):
         return
-    # 上游 AsyncImage 的 query 与 __resolutionId 都来自明确的编译属性/常量。
-    pattern = r'__dil\.jsx\(AsyncImage,\{[^\n]*?"query":("(?:[^"\\]|\\.)*"|__dilConstants\["\d+"\])[^\n]*?"__resolutionId":__dilConstants\["(\d+)"\]'
+    # 只读取明确的编译属性/常量；图片组查询也可能是字符串数组。
+    query_pattern = r'("(?:[^"\\]|\\.)*"|__dilConstants\["\d+"\]|\[(?:\s*"(?:[^"\\]|\\.)*"\s*,?)*\])'
+    pattern = r'__dil\.jsx\((AsyncImageGroup|AsyncImage),\{[^\n]*?"query":' + query_pattern + r'[^\n]*?"__resolutionId":__dilConstants\["(\d+)"\]'
     for match in re.finditer(pattern, str(dil.get("code") or "")):
-        query_value = match[1]
+        component, query_value = match[1], match[2]
         try:
             query = constants.get(re.search(r'"(\d+)"', query_value)[1]) if query_value.startswith("__dilConstants") else json.loads(query_value)
         except (ValueError, TypeError):
             continue
-        result = results.get(constants.get(match[2]), {})
-        if not isinstance(query, str) or not isinstance(result, dict):
+        group = component == "AsyncImageGroup"
+        valid_query = isinstance(query, str) and bool(query.strip())
+        if group and isinstance(query, list):
+            valid_query = bool(query) and len(query) <= 100 and all(isinstance(item, str) and item.strip() for item in query)
+        resolution_id = constants.get(match[3])
+        result = results.get(resolution_id, {}) if isinstance(resolution_id, str) else {}
+        if not valid_query or not isinstance(result, dict):
             continue
-        images = (result.get("state") or {}).get("images") or []
+        state = result.get("state")
+        images = state.get("images") if isinstance(state, dict) else None
+        if not isinstance(images, list):
+            continue
+        resolved = []
+        seen = set()
         for image in images:
             if not isinstance(image, dict):
                 continue
             src = _url(image.get("content_url")) or _url(image.get("thumbnail_url"))
-            if src:
-                resources["images"][query] = {"src": src, "title": str(image.get("title") or "参考图片")}
-                break
+            if src and src not in seen:
+                seen.add(src)
+                resolved.append({"src": src, "title": str(image.get("title") or "参考图片")})
+                if not group or len(resolved) >= 100:
+                    break
+        if resolved:
+            key = json.dumps(query, ensure_ascii=False, separators=(",", ":")) if isinstance(query, list) else query
+            resource = dict(resolved[0])
+            if group:
+                resource["images"] = resolved
+            resources["images"][key] = resource
     for result in results.values():
         if not isinstance(result, dict) or result.get("componentName") != "Cite":
             continue

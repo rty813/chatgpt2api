@@ -1132,7 +1132,7 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
     if delta:
         state.text += delta
         yield conversation_base_event("conversation.delta", state, delta=delta, reasoning_delta="")
-    if re.search(r"<(?:AsyncImage|Cite)\b", final_text):
+    if re.search(r"<(?:AsyncImageGroup|AsyncImage|Cite)\b", final_text):
         block = genui_resource_block(resources)
         if block:
             state.text += block

@@ -8,6 +8,39 @@ from services.protocol.genui_resources import collect_genui_resources
 
 
 class GenUIResourceTests(unittest.TestCase):
+    def test_image_group_keeps_all_images_for_literal_and_constant_array_queries(self):
+        queries = ["Project Hail Mary 2026 movie Rocky alien injured recovering glass sphere",
+                   "Project Hail Mary movie Rocky alien rock creature Ryan Gosling"]
+        for query_code, query in [(json.dumps(queries), queries), ('__dilConstants["2"]', queries),
+                                  (json.dumps("洛基"), "洛基")]:
+            with self.subTest(query=query_code):
+                metadata = {"model_dil_v2": {
+                    "code": '__dil.jsx(AsyncImageGroup,{"query":' + query_code + ',"aspectRatio":"5:4","layout":"bento","size":"lg","__resolutionId":__dilConstants["1"]})',
+                    "constants": {"1": "group-id", "2": queries},
+                    "appData": {"opGenui": {"componentResults": {"group-id": {
+                        "componentName": "AsyncImageGroup", "state": {"images": [
+                            {"content_url": "https://images.example.com/rocky-1.jpg", "title": "洛基 1"},
+                            {"content_url": "javascript:alert(1)", "thumbnail_url": "https://images.example.com/rocky-2.jpg", "title": "洛基 2"},
+                            {"content_url": "https://images.example.com/rocky-1.jpg"},
+                            {"content_url": "javascript:alert(2)"}, None,
+                        ]}}}}},
+                }}
+                body = '<AsyncImageGroup query={' + json.dumps(query, ensure_ascii=False) + '} aspectRatio="5:4" layout="bento" size="lg"/>'
+                message = {"id": "group-answer", "author": {"role": "assistant"}, "channel": "final",
+                           "status": "finished_successfully", "content": {"content_type": "text", "parts": [body]}}
+                for thinking in [True, False]:
+                    events = list(iter_conversation_payloads(iter([
+                        json.dumps({"message": message}), json.dumps({"message": {**message, "metadata": metadata}}), "[DONE]",
+                    ]), thinking=thinking))
+                    deltas = [event["delta"] for event in events if event.get("delta")]
+                    self.assertEqual(deltas[0], body)
+                    resources = json.loads(deltas[1].split('data={', 1)[1].removesuffix('}/>'))
+                    key = json.dumps(query, ensure_ascii=False, separators=(",", ":")) if isinstance(query, list) else query
+                    images = resources["images"][key]["images"]
+                    self.assertEqual([image["src"] for image in images], ["https://images.example.com/rocky-1.jpg", "https://images.example.com/rocky-2.jpg"])
+                    self.assertNotIn("javascript:", deltas[1])
+                    self.assertEqual(events[-1]["text"], "".join(deltas))
+
     def test_late_resource_metadata_survives_append_only_stream(self):
         body = '<box><AsyncImage query="走廊"/><text>说明<Cite refs={["turn0view0"]}/></text></box>'
         message = {"id": "answer", "author": {"role": "assistant"}, "channel": "final",
