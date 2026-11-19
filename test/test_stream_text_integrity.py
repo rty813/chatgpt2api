@@ -147,9 +147,19 @@ class StreamTextIntegrityTests(unittest.TestCase):
         self.assert_content([message("a", "重复示例\n"), message("b", "重复示例\n"), "[DONE]"],
                             "重复示例\n重复示例\n", thinking=True)
 
-    def test_revised_non_thinking_snapshot_still_fails_safely(self):
-        with self.assertRaisesRegex(RuntimeError, "append-only"):
-            stream([message("a", "方案 A"), message("a", "方案 B"), "[DONE]"], thinking=False)
+    def test_revised_non_thinking_snapshot_fails_safely_and_dumps_payloads(self):
+        from pathlib import Path
+        import tempfile
+        from services.protocol import conversation
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(conversation, "STREAM_DIAGNOSTICS_DIR", Path(tmp)):
+            with self.assertRaisesRegex(RuntimeError, "append-only"):
+                stream([message("a", "方案 A"), message("a", "方案 B"), "[DONE]"], thinking=False)
+            dumps = list(Path(tmp).glob("prefix_rewrite_*.json"))
+            self.assertEqual(len(dumps), 1)
+            data = json.loads(dumps[0].read_text(encoding="utf-8"))
+            self.assertEqual((data["emitted"], data["rewritten"], data["diverge_at"]), ("方案 A", "方案 B", 3))
+            self.assertEqual(len(data["payloads"]), 2)  # 只记录到报错为止已消费的事件。
 
     def test_unconfirmed_thinking_snapshots_are_not_emitted_before_upstream_done(self):
         payloads = iter([

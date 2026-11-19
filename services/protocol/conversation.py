@@ -12,7 +12,7 @@ import tiktoken
 from fastapi import HTTPException
 
 from services.account_service import account_service
-from services.config import config
+from services.config import DATA_DIR, config
 from services.file_storage_service import file_storage_service
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
@@ -1068,6 +1068,15 @@ def _rebuild_message_text(state: ConversationState, *, thinking: bool, stable_on
     return answer, "\n\n".join(part for part in reasoning_parts if part)
 
 
+class PrefixRewriteError(RuntimeError):
+    """上游改写了已发出的前缀；携带两版文本供诊断落盘。"""
+
+    def __init__(self, previous: str, current: str):
+        super().__init__("upstream text changed an emitted prefix; cannot represent it as append-only deltas")
+        self.previous = previous
+        self.current = current
+
+
 def _snapshot_delta(previous: str, current: str) -> str:
     """只将累计快照的新增后缀转换为增量；过期快照不重复发出。"""
     if current.startswith(previous):
@@ -1075,12 +1084,60 @@ def _snapshot_delta(previous: str, current: str) -> str:
     if previous.startswith(current):
         return ""
     # OpenAI 增量协议不能撤回已发文本；明确报错，避免把全文当增量污染下游存储。
-    raise RuntimeError("upstream text changed an emitted prefix; cannot represent it as append-only deltas")
+    raise PrefixRewriteError(previous, current)
+
+
+STREAM_DIAGNOSTICS_DIR = DATA_DIR / "stream_diagnostics"
+STREAM_DIAGNOSTICS_KEEP = 50
+
+
+def _dump_prefix_rewrite(payloads: list[str], exc: PrefixRewriteError, thinking: bool) -> str:
+    """把触发前缀改写的完整上游事件流写入 data/stream_diagnostics，只保留最近若干份。"""
+    previous, current = exc.previous, exc.current
+    index = next((i for i in range(min(len(previous), len(current))) if previous[i] != current[i]),
+                 min(len(previous), len(current)))
+    STREAM_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+    path = STREAM_DIAGNOSTICS_DIR / f"prefix_rewrite_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000:06d}.json"
+    path.write_text(json.dumps({
+        "thinking": thinking,
+        "payload_count": len(payloads),
+        "diverge_at": index,
+        "emitted_tail": previous[max(0, index - 200):],
+        "rewritten_tail": current[max(0, index - 200):index + 500],
+        "emitted": previous,
+        "rewritten": current,
+        "payloads": payloads,
+    }, ensure_ascii=False, indent=1), encoding="utf-8")
+    for old in sorted(STREAM_DIAGNOSTICS_DIR.glob("prefix_rewrite_*.json"))[:-STREAM_DIAGNOSTICS_KEEP]:
+        old.unlink(missing_ok=True)
+    return str(path)
 
 
 def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
                                history_messages: list[str] | None = None,
                                thinking: bool = False) -> Iterator[dict[str, Any]]:
+    """记录已消费的上游事件；出现前缀改写时落盘诊断后照常抛出。"""
+    recorded: list[str] = []
+
+    def tee() -> Iterator[str]:
+        for payload in payloads:
+            recorded.append(payload)
+            yield payload
+
+    try:
+        yield from _iter_conversation_payloads(tee(), history_text, history_messages, thinking)
+    except PrefixRewriteError as exc:
+        try:
+            path = _dump_prefix_rewrite(recorded, exc, thinking)
+            logger.warning({"event": "prefix_rewrite_dumped", "path": path, "payload_count": len(recorded)})
+        except Exception as dump_exc:
+            logger.warning({"event": "prefix_rewrite_dump_failed", "error": str(dump_exc)})
+        raise
+
+
+def _iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
+                                history_messages: list[str] | None = None,
+                                thinking: bool = False) -> Iterator[dict[str, Any]]:
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
